@@ -1,5 +1,7 @@
 import aiosqlite
 import os
+import uuid
+import secrets
 
 DB_PATH = os.getenv('DB_PATH', './nydus.db')
 
@@ -48,3 +50,33 @@ async def get_project_by_uuid(uuid):
         async with db.execute("SELECT * FROM webhook_projects WHERE webhook_uuid = ?", (uuid,)) as cursor:
             row = await cursor.fetchone()
             return dict(row) if row else None
+
+async def get_all_projects():
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute("SELECT * FROM webhook_projects ORDER BY id DESC") as cursor:
+            rows = await cursor.fetchall()
+            return [dict(row) for row in rows]
+
+async def create_new_project(name, repo_url, branch, deploy_path, tech_stack):
+    # Generate secure identifiers
+    new_uuid = str(uuid.uuid4())
+    new_secret = secrets.token_hex(24)
+    
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            """INSERT INTO webhook_projects 
+               (webhook_uuid, project_name, github_repository_url, branch, deploy_path, webhook_secret) 
+               VALUES (?, ?, ?, ?, ?, ?)""",
+            (new_uuid, name, repo_url, branch, deploy_path, new_secret)
+        )
+        await db.commit()
+        return {
+            "webhook_uuid": new_uuid,
+            "webhook_secret": new_secret
+        }
+
+async def delete_project(uuid):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("DELETE FROM webhook_projects WHERE webhook_uuid = ?", (uuid,))
+        await db.commit()

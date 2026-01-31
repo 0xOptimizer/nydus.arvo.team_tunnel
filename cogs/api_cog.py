@@ -4,7 +4,8 @@ import os
 import hmac
 import hashlib
 import json
-from database.db import get_recent_usage, get_deployments, get_project_by_uuid
+import logging
+from database.db import get_recent_usage, get_deployments, get_project_by_uuid, get_all_projects, create_new_project, delete_project
 
 class ApiCog(commands.Cog):
     def __init__(self, bot):
@@ -14,6 +15,7 @@ class ApiCog(commands.Cog):
         self.runner = None
         self.site = None
         self.port = int(os.getenv('PORT', 4000))
+        self.logger = logging.getLogger('nydus')
         self.start_server.start()
 
     def cog_unload(self):
@@ -25,6 +27,9 @@ class ApiCog(commands.Cog):
         self.app.router.add_get('/api/deployments', self.handle_deployments)
         self.app.router.add_get('/api/nginx/status', self.handle_nginx_status)
         self.app.router.add_post('/api/nginx/reload', self.handle_nginx_reload)
+        self.app.router.add_get('/api/projects', self.handle_get_projects)
+        self.app.router.add_post('/api/projects', self.handle_create_project)
+        self.app.router.add_delete('/api/projects/{uuid}', self.handle_delete_project)
 
     @tasks.loop(count=1)
     async def start_server(self):
@@ -35,7 +40,7 @@ class ApiCog(commands.Cog):
         
         output = self.bot.get_cog('OutputCog')
         if output:
-            await output.queue_message(f"API Server listening on port {self.port}")
+            await self.logger.info(f"API Server listening on port {self.port}")
 
     @start_server.before_loop
     async def before_start_server(self):
@@ -92,6 +97,33 @@ class ApiCog(commands.Cog):
             return web.json_response({'status': 'Deployment queued'})
         
         return web.json_response({'error': 'Deployment module unavailable'}, status=500)
+
+    async def handle_get_projects(self, request):
+        projects = await get_all_projects()
+        return web.json_response(projects)
+
+    async def handle_create_project(self, request):
+        try:
+            data = await request.json()
+            # Basic validation
+            if not all(k in data for k in ('project_name', 'deploy_path')):
+                return web.json_response({'error': 'Missing required fields'}, status=400)
+                
+            result = await create_new_project(
+                name=data['project_name'],
+                repo_url=data.get('github_repository_url', ''),
+                branch=data.get('branch', 'main'),
+                deploy_path=data['deploy_path'],
+                tech_stack=data.get('tech_stack', 'Node.js') # We can store this in DB if we add a column later
+            )
+            return web.json_response(result, status=201)
+        except Exception as e:
+            return web.json_response({'error': str(e)}, status=500)
+
+    async def handle_delete_project(self, request):
+        uuid = request.match_info['uuid']
+        await delete_project(uuid)
+        return web.json_response({'status': 'deleted'})
 
 def setup(bot):
     bot.add_cog(ApiCog(bot))
