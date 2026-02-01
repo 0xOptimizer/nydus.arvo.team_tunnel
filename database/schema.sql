@@ -7,6 +7,8 @@ CREATE TABLE IF NOT EXISTS usage_logs (
     active_connections INTEGER
 );
 
+CREATE INDEX IF NOT EXISTS idx_usage_timestamp ON usage_logs(timestamp);    
+
 CREATE TABLE IF NOT EXISTS deployment_history (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     project_name TEXT,
@@ -29,6 +31,9 @@ CREATE TABLE IF NOT EXISTS webhook_projects (
     github_repository_url TEXT,
     branch TEXT DEFAULT 'main',
     deploy_path TEXT,
+    tech_stack TEXT,
     webhook_secret TEXT,
+    cloudflare_record_id TEXT,
+    subdomain TEXT,
     last_deployed_at TIMESTAMP
 );

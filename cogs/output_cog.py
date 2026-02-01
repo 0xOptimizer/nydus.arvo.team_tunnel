@@ -1,42 +1,58 @@
 import discord
 from discord.ext import commands, tasks
 import asyncio
-import logging
-import json
 import os
 
 class OutputCog(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
-        self.queue = asyncio.Queue()
-        self.logger = logging.getLogger('nydus')
-        self.channel_ids = json.loads(os.getenv('DEFAULT_OUTPUT_CHANNELS', '[]'))
+        self.channel_id = int(os.getenv('DISCORD_CHANNEL_ID', 0))
+        self.message_queue = asyncio.Queue()
         self.process_queue.start()
 
     def cog_unload(self):
         self.process_queue.cancel()
 
-    async def queue_message(self, message, level='INFO'):
-        log_msg = f"[{level}] {message}"
-        self.logger.info(log_msg)
-        await self.queue.put(f"**[{level}]** {message}")
+    async def send_embed(self, title, description, color, fields=None):
+        embed = discord.Embed(title=title, description=description, color=color)
+        if fields:
+            for name, value in fields.items():
+                embed.add_field(name=name, value=value, inline=False)
+        embed.set_footer(text="Nydus Tunnel System")
+        
+        await self.message_queue.put((None, embed))
 
-    @tasks.loop(seconds=1.5)
+    async def queue_message(self, message, msg_type="INFO"):
+        if msg_type == "ERROR":
+            content = f"**ERROR:** {message}"
+        elif msg_type == "SUCCESS":
+            content = f"**SUCCESS:** {message}"
+        else:
+            content = f"{message}"
+
+        await self.message_queue.put((content, None))
+
+    @tasks.loop(seconds=1.0)
     async def process_queue(self):
-        if self.queue.empty():
+        if self.message_queue.empty():
             return
 
-        message = await self.queue.get()
-        
-        for channel_id in self.channel_ids:
-            try:
-                channel = self.bot.get_channel(channel_id)
-                if channel:
-                    await channel.send(message)
-            except Exception as e:
-                self.logger.error(f"Failed to send to Discord: {e}")
+        channel = self.bot.get_channel(self.channel_id)
+        if not channel:
+            return
+
+        try:
+            content, embed = await self.message_queue.get()
             
-        self.queue.task_done()
+            if embed:
+                await channel.send(content=content, embed=embed)
+            else:
+                await channel.send(content=content)
+            
+            self.message_queue.task_done()
+            
+        except Exception as e:
+            print(f"Failed to send message: {e}")
 
     @process_queue.before_loop
     async def before_process_queue(self):

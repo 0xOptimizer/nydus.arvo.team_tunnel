@@ -29,14 +29,23 @@ cogs_list = [
 
 @bot.event
 async def on_ready():
-    await init_db()
     logging.info(f'Nydus Tunnel active as {bot.user}')
 
-for cog in cogs_list:
-    try:
-        bot.load_extension(cog)
-    except Exception as e:
-        logging.error(f"Failed to load cog {cog}: {e}")
+async def main():
+    await init_db()
+    
+    for cog in cogs_list:
+        try:
+            bot.load_extension(cog)
+        except Exception as e:
+            logging.error(f"Failed to load cog {cog}: {e}")
+    
+    async with bot:
+        await bot.start(os.getenv('NYDUS_BOT_TOKEN_ID'))
 
 if __name__ == "__main__":
-    bot.run(os.getenv('NYDUS_BOT_TOKEN_ID'))
+    try:
+        loop = asyncio.get_event_loop()
+        loop.run_until_complete(main())
+    except KeyboardInterrupt:
+        pass

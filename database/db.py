@@ -58,22 +58,24 @@ async def get_all_projects():
             rows = await cursor.fetchall()
             return [dict(row) for row in rows]
 
-async def create_new_project(name, repo_url, branch, deploy_path, tech_stack):
-    # Generate secure identifiers
+async def create_new_project(name, repo_url, branch, tech_stack, subdomain, cloudflare_id):
     new_uuid = str(uuid.uuid4())
-    new_secret = secrets.token_hex(24)
+    new_secret = secrets.token_hex(16)
+    deploy_path = f"/var/www/{new_uuid}"
     
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
             """INSERT INTO webhook_projects 
-               (webhook_uuid, project_name, github_repository_url, branch, deploy_path, webhook_secret) 
-               VALUES (?, ?, ?, ?, ?, ?)""",
-            (new_uuid, name, repo_url, branch, deploy_path, new_secret)
+               (webhook_uuid, project_name, github_repository_url, branch, deploy_path, tech_stack, webhook_secret, subdomain, cloudflare_record_id) 
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (new_uuid, name, repo_url, branch, deploy_path, tech_stack, new_secret, subdomain, cloudflare_id)
         )
         await db.commit()
         return {
+            "success": True,
             "webhook_uuid": new_uuid,
-            "webhook_secret": new_secret
+            "webhook_secret": new_secret,
+            "deploy_path": deploy_path
         }
 
 async def delete_project(uuid):
