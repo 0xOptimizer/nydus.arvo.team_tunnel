@@ -12,6 +12,13 @@ async def init_db():
     async with aiosqlite.connect(DB_PATH) as db:
         with open('database/schema.sql', 'r') as f:
             await db.executescript(f.read())
+        
+        try:
+            await db.execute("ALTER TABLE webhook_projects ADD COLUMN tech_stack TEXT")
+            await db.commit()
+        except aiosqlite.OperationalError:
+            pass 
+            
         await db.commit()
 
 async def log_usage(cpu, ram, disk, connections):
