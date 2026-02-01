@@ -6,7 +6,14 @@ import hashlib
 import json
 import logging
 import traceback
-from database.db import get_recent_usage, get_deployments, get_project_by_uuid, get_all_projects, create_new_project, delete_project
+import asyncio
+from database.db import (
+    get_recent_usage, 
+    get_project_by_uuid, 
+    get_all_projects, 
+    create_new_project, 
+    delete_project
+)
 
 class ApiCog(commands.Cog):
     def __init__(self, bot):
@@ -24,10 +31,11 @@ class ApiCog(commands.Cog):
         self.start_server.cancel()
 
     def setup_routes(self):
-        self.app.router.add_post('/webhook/{uuid}', self.handle_webhook)
+        self.app.router.add_get('/api/stats', self.handle_get_stats)
         self.app.router.add_get('/api/projects', self.handle_get_projects)
         self.app.router.add_post('/api/projects', self.handle_create_project)
         self.app.router.add_delete('/api/projects/{uuid}', self.handle_delete_project)
+        self.app.router.add_post('/webhook/{uuid}', self.handle_webhook)
         self.app.router.add_options('/{tail:.*}', self.handle_options)
 
     @tasks.loop(count=1)
@@ -47,6 +55,14 @@ class ApiCog(commands.Cog):
             'Access-Control-Allow-Methods': 'GET, POST, DELETE, OPTIONS',
             'Access-Control-Allow-Headers': 'Content-Type'
         })
+
+    async def handle_get_stats(self, request):
+        try:
+            stats = await get_recent_usage(limit=1)
+            return web.json_response(stats, headers={'Access-Control-Allow-Origin': '*'})
+        except Exception as e:
+            self.logger.error(f"Stats API Error: {e}")
+            return web.json_response({'error': str(e)}, status=500)
 
     async def handle_get_projects(self, request):
         projects = await get_all_projects()
