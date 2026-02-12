@@ -31,8 +31,6 @@ class UsersCog(commands.Cog):
         user_ids = list(set(re.findall(r"\d+", users)))
 
         if not user_ids:
-            if output_cog:
-                await output_cog.queue_message("No valid IDs found.", "ERROR")
             await ctx.followup.send("No valid IDs found.")
             return
 
@@ -40,7 +38,7 @@ class UsersCog(commands.Cog):
         error_list = []
 
         async with self._lock:
-            for user_id in user_ids:
+            for count, user_id in enumerate(user_ids):
                 try:
                     target_id = int(user_id)
                     user = self.bot.get_user(target_id) or await self.bot.fetch_user(target_id)
@@ -54,6 +52,10 @@ class UsersCog(commands.Cog):
                         added_list.append(f"{user.mention} ({user.id})")
                     else:
                         error_list.append(f"Database error for {user_id}.")
+                    
+                    if count % 5 == 0:
+                        await asyncio.sleep(0.01)
+
                 except Exception as e:
                     error_list.append(f"Error processing {user_id}: {str(e)}")
 
@@ -83,12 +85,15 @@ class UsersCog(commands.Cog):
         error_list = []
 
         async with self._lock:
-            for user_id in user_ids:
+            for count, user_id in enumerate(user_ids):
                 try:
                     if await remove_user(str(user_id)):
                         removed_list.append(str(user_id))
                     else:
                         error_list.append(f"ID {user_id} not found in database.")
+                    
+                    if count % 10 == 0:
+                        await asyncio.sleep(0.01)
                 except Exception as e:
                     error_list.append(f"Error removing {user_id}: {str(e)}")
 
