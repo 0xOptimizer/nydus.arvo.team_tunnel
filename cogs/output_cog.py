@@ -8,7 +8,7 @@ from datetime import datetime
 class OutputView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
-        self.add_item(discord.ui.Button(label="Click here to access the Nydus", url="https://nydus.arvo.team"))
+        self.add_item(discord.ui.Button(label="Access the Nydus", url="https://nydus.arvo.team"))
 
 class OutputCog(commands.Cog):
     def __init__(self, bot):
