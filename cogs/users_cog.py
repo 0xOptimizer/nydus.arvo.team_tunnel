@@ -37,7 +37,7 @@ class UsersCog(commands.Cog):
         if not await self.check_dev(ctx):
             return
 
-        await ctx.respond("Processing additions...", ephemeral=True)
+        await ctx.defer(ephemeral=True)
 
         output_cog = self.bot.get_cog('OutputCog')
         user_ids = re.findall(r"\d+", users)
@@ -45,6 +45,7 @@ class UsersCog(commands.Cog):
         if not user_ids:
             if output_cog:
                 await output_cog.queue_message("No valid IDs found.", "ERROR")
+            await ctx.followup.send("No valid IDs found.", ephemeral=True)
             return
 
         added_list = []
@@ -69,19 +70,23 @@ class UsersCog(commands.Cog):
             except Exception as e:
                 error_list.append(f"Error processing {user_id}: {str(e)}")
 
-        if output_cog:
-            if added_list:
-                full_message = "\n".join(added_list)
-                for chunk in self.split_message(full_message):
+        if added_list:
+            full_message = "\n".join(added_list)
+            for chunk in self.split_message(full_message):
+                if output_cog:
                     await output_cog.send_embed(
                         title="Access Granted",
                         description=chunk,
                         color=discord.Color.green()
                     )
-            if error_list:
-                full_message = "\n".join(error_list)
-                for chunk in self.split_message(full_message):
+        
+        if error_list:
+            full_message = "\n".join(error_list)
+            for chunk in self.split_message(full_message):
+                if output_cog:
                     await output_cog.queue_message(chunk, "ERROR")
+
+        await ctx.followup.send("Processing complete!", ephemeral=True)
 
     @discord.slash_command(name="remove", description="Disallows users from entering the Nydus")
     @option("users", description="User IDs or mentions")
@@ -93,7 +98,7 @@ class UsersCog(commands.Cog):
         if not await self.check_dev(ctx):
             return
 
-        await ctx.respond("Processing removals...", ephemeral=True)
+        await ctx.defer(ephemeral=True)
 
         output_cog = self.bot.get_cog('OutputCog')
         user_ids = re.findall(r"\d+", users)
@@ -101,6 +106,7 @@ class UsersCog(commands.Cog):
         if not user_ids:
             if output_cog:
                 await output_cog.queue_message("No valid IDs found.", "ERROR")
+            await ctx.followup.send("No valid IDs found.", ephemeral=True)
             return
 
         removed_list = []
@@ -116,19 +122,23 @@ class UsersCog(commands.Cog):
             except Exception as e:
                 error_list.append(f"Error removing {user_id}: {str(e)}")
 
-        if output_cog:
-            if removed_list:
-                full_message = f"Removed IDs: {', '.join(removed_list)}"
-                for chunk in self.split_message(full_message):
+        if removed_list:
+            full_message = f"Removed IDs: {', '.join(removed_list)}"
+            for chunk in self.split_message(full_message):
+                if output_cog:
                     await output_cog.send_embed(
                         title="Access Revoked",
                         description=chunk,
                         color=discord.Color.red()
                     )
-            if error_list:
-                full_message = "\n".join(error_list)
-                for chunk in self.split_message(full_message):
+        
+        if error_list:
+            full_message = "\n".join(error_list)
+            for chunk in self.split_message(full_message):
+                if output_cog:
                     await output_cog.queue_message(chunk, "ERROR")
+
+        await ctx.followup.send("Processing complete!", ephemeral=True)
 
 def setup(bot):
     bot.add_cog(UsersCog(bot))
