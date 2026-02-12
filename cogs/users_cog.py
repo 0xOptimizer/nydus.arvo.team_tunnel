@@ -33,20 +33,21 @@ class UsersCog(commands.Cog):
         async with self._lock:
             for count, user_id in enumerate(user_ids):
                 try:
-                    if user_id in self._id_cache:
+                    str_id = str(user_id)
+                    if str_id in self._id_cache:
                         continue
 
                     target_id = int(user_id)
                     user = self.bot.get_user(target_id) or await self.bot.fetch_user(target_id)
                     
-                    if await get_user(str(user.id)):
-                        self._id_cache.add(str(user.id))
+                    if await get_user(str_id):
+                        self._id_cache.add(str_id)
                         error_list.append(f"{user.mention} is already in the database.")
-                    elif await add_user(str(user.id), user.name):
-                        self._id_cache.add(str(user.id))
+                    elif await add_user(str_id, user.name):
+                        self._id_cache.add(str_id)
                         added_list.append(f"{user.mention} ({user.id})")
                     
-                    if count % 5 == 0:
+                    if count % 5 == 0 and count > 0:
                         await asyncio.sleep(0.05)
                 except Exception as e:
                     error_list.append(f"Error {user_id}: {str(e)}")
@@ -73,15 +74,21 @@ class UsersCog(commands.Cog):
         async with self._lock:
             for count, user_id in enumerate(user_ids):
                 try:
-                    if await remove_user(str(user_id)):
-                        if str(user_id) in self._id_cache:
-                            self._id_cache.remove(str(user_id))
-                        removed_list.append(str(user_id))
+                    str_id = str(user_id)
+                    
+                    success = await remove_user(str_id)
+                    
+                    if not success:
+                        success = await remove_user(int(user_id))
+
+                    if success:
+                        self._id_cache.discard(str_id)
+                        removed_list.append(str_id)
                     else:
                         error_list.append(f"ID {user_id} not found.")
                     
-                    if count % 10 == 0:
-                        await asyncio.sleep(0.05)
+                    if count % 10 == 0 and count > 0:
+                        await asyncio.sleep(0.01)
                 except Exception as e:
                     error_list.append(f"Error: {str(e)}")
 
