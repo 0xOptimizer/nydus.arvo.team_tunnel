@@ -4,6 +4,15 @@ import asyncio
 import os
 import json
 
+class OutputView(discord.ui.View):
+    def __init__(self):
+        super().__init__()
+        self.add_item(discord.ui.Button(label=1, url=2))
+
+    def update_button(self):
+        self.clear_items()
+        self.add_item(discord.ui.Button(label="Access the Nydus", url="https://nydus.arvo.team"))
+
 class OutputCog(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
@@ -63,7 +72,9 @@ class OutputCog(commands.Cog):
             channel = self.bot.get_channel(target_id) or await self.bot.fetch_channel(target_id)
             
             if channel:
-                await channel.send(content=content, embed=embed)
+                view = OutputView()
+                view.update_button()
+                await channel.send(content=content, embed=embed, view=view)
         except (discord.NotFound, discord.Forbidden, discord.HTTPException) as e:
             print(f"Failed to send to {channel_id}: {e}")
         except Exception as e:
@@ -73,5 +84,5 @@ class OutputCog(commands.Cog):
     async def before_process_queue(self):
         await self.bot.wait_until_ready()
 
-def setup(bot):
-    bot.add_cog(OutputCog(bot))
+async def setup(bot):
+    await bot.add_cog(OutputCog(bot))
