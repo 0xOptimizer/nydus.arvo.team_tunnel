@@ -80,13 +80,30 @@ class UsersCog(commands.Cog):
             return
 
         removed_list = []
+        error_list = []
+
         async with self._lock:
             for user_id in user_ids:
-                if await remove_user(str(user_id)):
-                    removed_list.append(str(user_id))
+                try:
+                    if await remove_user(str(user_id)):
+                        removed_list.append(str(user_id))
+                    else:
+                        error_list.append(f"ID {user_id} not found in database.")
+                except Exception as e:
+                    error_list.append(f"Error removing {user_id}: {str(e)}")
 
-        if output_cog and removed_list:
-            await output_cog.send_embed("Access Revoked", f"Removed IDs: {', '.join(removed_list)}", discord.Color.red())
+        if output_cog:
+            if removed_list:
+                for i in range(0, len(removed_list), 20):
+                    await output_cog.send_embed(
+                        "Access Revoked", 
+                        f"Removed IDs:\n{', '.join(removed_list[i:i + 20])}", 
+                        discord.Color.red()
+                    )
+            
+            if error_list:
+                for i in range(0, len(error_list), 10):
+                    await output_cog.queue_message("\n".join(error_list[i:i + 10]), "ERROR")
 
         await ctx.followup.send("Removal processing complete!")
 
