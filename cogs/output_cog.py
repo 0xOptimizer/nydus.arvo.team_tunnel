@@ -28,7 +28,7 @@ class OutputCog(commands.Cog):
         if fields:
             for name, value in fields.items():
                 embed.add_field(name=name, value=value, inline=False)
-        embed.set_footer(text="https://nydus.arvo.team • Nydus Tunnel System")
+        embed.set_footer(text="https://nydus.arvo.team • Nydus Tunnel Network")
         
         await self.message_queue.put((None, embed))
 
