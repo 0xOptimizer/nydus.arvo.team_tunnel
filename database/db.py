@@ -132,3 +132,23 @@ async def delete_project(uuid):
         "DELETE FROM webhook_projects WHERE webhook_uuid = %s", 
         (uuid,)
     )
+
+async def add_user(discord_id, username=None):
+    new_uuid = str(uuid.uuid4())
+    return await execute_query(
+        "INSERT INTO users (user_uuid, discord_id, username) VALUES (%s, %s, %s)",
+        (new_uuid, discord_id, username)
+    )
+
+async def remove_user(discord_id):
+    return await execute_query(
+        "DELETE FROM users WHERE discord_id = %s",
+        (discord_id,)
+    )
+
+async def get_user(discord_id):
+    return await execute_query(
+        "SELECT * FROM users WHERE discord_id = %s",
+        (discord_id,),
+        fetch_one=True
+    )
