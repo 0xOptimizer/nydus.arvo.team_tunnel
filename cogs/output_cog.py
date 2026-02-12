@@ -28,14 +28,14 @@ class OutputCog(commands.Cog):
         if fields:
             for name, value in fields.items():
                 embed.add_field(name=name, value=value, inline=False)
-        embed.set_footer(text="Nydus Tunnel System")
+        embed.set_footer(text="https://nydus.arvo.team • Nydus Tunnel System")
         
         await self.message_queue.put((None, embed))
 
     async def queue_message(self, message, msg_type="INFO"):
         prefixes = {
-            "ERROR": "**ERROR:** ",
-            "SUCCESS": "**SUCCESS:** ",
+            "ERROR": "",
+            "SUCCESS": "",
             "INFO": ""
         }
         content = f"{prefixes.get(msg_type, '')}{message}"

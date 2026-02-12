@@ -55,7 +55,7 @@ class UsersCog(commands.Cog):
                 existing = await get_user(str(user.id))
 
                 if existing:
-                    error_list.append(f"User {user.mention} is already in the database.")
+                    error_list.append(f"{user.mention} is already in the database.")
                     continue
 
                 result = await add_user(str(user.id), user.name)
@@ -112,7 +112,7 @@ class UsersCog(commands.Cog):
                 if result:
                     removed_list.append(str(user_id))
                 else:
-                    error_list.append(f"User {user_id} not found in database.")
+                    error_list.append(f"{user_id} not found in database.")
             except Exception as e:
                 error_list.append(f"Error removing {user_id}: {str(e)}")
 
