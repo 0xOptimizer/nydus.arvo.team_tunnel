@@ -2,8 +2,7 @@ import discord
 from discord.ext import commands, tasks
 import psutil
 import logging
-from database.db import log_usage, DB_PATH
-import aiosqlite
+from database.db import log_usage, execute_query
 
 class MonitoringCog(commands.Cog):
     def __init__(self, bot):
@@ -30,13 +29,10 @@ class MonitoringCog(commands.Cog):
     @tasks.loop(hours=24)
     async def cleanup_old_logs(self):
         try:
-            async with aiosqlite.connect(DB_PATH) as db:
-                await db.execute(
-                    "DELETE FROM usage_logs WHERE timestamp < datetime('now', '-7 days')"
-                )
-                await db.commit()
-                await db.execute("VACUUM")
-                await db.commit()
+            await execute_query(
+                "DELETE FROM usage_logs WHERE timestamp < NOW() - INTERVAL 7 DAY"
+            )
+            logging.info("Cleaned up old usage logs.")
         except Exception as e:
             logging.error(f"Cleanup error: {e}")
 
