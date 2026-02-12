@@ -11,13 +11,12 @@ class UsersCog(commands.Cog):
         self.bot = bot
         self.dev_id = int(os.environ.get("DEV_ID", 0))
         self._lock = asyncio.Lock()
+        self._id_cache = set()
 
     async def check_dev(self, ctx: discord.ApplicationContext) -> bool:
         if ctx.author.id == self.dev_id:
             return True
-        dev_user = self.bot.get_user(self.dev_id)
-        dev_mention = dev_user.mention if dev_user else f"<@{self.dev_id}>"
-        await ctx.respond(f"You are not {dev_mention}", ephemeral=True)
+        await ctx.respond("Unauthorized.", ephemeral=True)
         return False
 
     @discord.slash_command(name="add", description="Allows users to enter the Nydus")
@@ -29,26 +28,26 @@ class UsersCog(commands.Cog):
 
         output_cog = self.bot.get_cog("OutputCog")
         user_ids = list(set(re.findall(r"\d+", users)))
-
-        if not user_ids:
-            await ctx.followup.send("No valid IDs found.")
-            return
-
         added_list, error_list = [], []
 
         async with self._lock:
             for count, user_id in enumerate(user_ids):
                 try:
+                    if user_id in self._id_cache:
+                        continue
+
                     target_id = int(user_id)
                     user = self.bot.get_user(target_id) or await self.bot.fetch_user(target_id)
                     
                     if await get_user(str(user.id)):
+                        self._id_cache.add(str(user.id))
                         error_list.append(f"{user.mention} is already in the database.")
                     elif await add_user(str(user.id), user.name):
+                        self._id_cache.add(str(user.id))
                         added_list.append(f"{user.mention} ({user.id})")
                     
                     if count % 5 == 0:
-                        await asyncio.sleep(0.01)
+                        await asyncio.sleep(0.05)
                 except Exception as e:
                     error_list.append(f"Error {user_id}: {str(e)}")
 
@@ -75,11 +74,14 @@ class UsersCog(commands.Cog):
             for count, user_id in enumerate(user_ids):
                 try:
                     if await remove_user(str(user_id)):
+                        if str(user_id) in self._id_cache:
+                            self._id_cache.remove(str(user_id))
                         removed_list.append(str(user_id))
                     else:
                         error_list.append(f"ID {user_id} not found.")
+                    
                     if count % 10 == 0:
-                        await asyncio.sleep(0.01)
+                        await asyncio.sleep(0.05)
                 except Exception as e:
                     error_list.append(f"Error: {str(e)}")
 

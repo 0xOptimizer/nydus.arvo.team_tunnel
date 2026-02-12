@@ -3,7 +3,6 @@ from discord.ext import commands, tasks
 import asyncio
 import os
 import json
-from datetime import datetime
 
 class OutputView(discord.ui.View):
     def __init__(self):
@@ -13,7 +12,6 @@ class OutputView(discord.ui.View):
 class OutputCog(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
-        
         raw_channels = os.getenv("DEFAULT_OUTPUT_CHANNELS", "[]")
         try:
             self.channel_ids = json.loads(raw_channels)
@@ -34,15 +32,11 @@ class OutputCog(commands.Cog):
             for name, value in fields.items():
                 embed.add_field(name=str(name), value=str(value), inline=False)
         embed.set_footer(text="https://nydus.arvo.team • Nydus Tunnel Network")
-        
         await self.message_queue.put((None, embed))
 
     async def queue_message(self, message, msg_type="INFO"):
         if not isinstance(message, str):
-            try:
-                message = json.dumps(message, default=str)
-            except Exception:
-                message = str(message)
+            message = json.dumps(message, default=str)
 
         content = f"**{msg_type}**: {message}"
         await self.message_queue.put((content, None))
@@ -51,22 +45,17 @@ class OutputCog(commands.Cog):
     async def process_queue(self):
         if self.message_queue.empty():
             return
-
         try:
             content, embed = await self.message_queue.get()
-            dispatch_tasks = [self.dispatch_message(cid, content, embed) for cid in self.channel_ids]
-            if dispatch_tasks:
-                await asyncio.gather(*dispatch_tasks)
+            for channel_id in self.channel_ids:
+                try:
+                    target_id = int(channel_id)
+                    channel = self.bot.get_channel(target_id) or await self.bot.fetch_channel(target_id)
+                    if channel:
+                        await channel.send(content=content, embed=embed, view=OutputView())
+                except Exception:
+                    continue
             self.message_queue.task_done()
-        except Exception:
-            pass
-
-    async def dispatch_message(self, channel_id, content, embed):
-        try:
-            target_id = int(channel_id)
-            channel = self.bot.get_channel(target_id) or await self.bot.fetch_channel(target_id)
-            if channel:
-                await channel.send(content=content, embed=embed, view=OutputView())
         except Exception:
             pass
 
