@@ -38,18 +38,22 @@ class OutputCog(commands.Cog):
             return
 
         channel = self.bot.get_channel(self.channel_id)
+        
         if not channel:
-            return
+            try:
+                channel = await self.bot.fetch_channel(self.channel_id)
+            except Exception as e:
+                print(f"Could not find channel {self.channel_id}: {e}")
+                return
 
         try:
-            content, embed = await self.message_queue.get()
-            
-            if embed:
+            while not self.message_queue.empty():
+                content, embed = await self.message_queue.get()
+                
                 await channel.send(content=content, embed=embed)
-            else:
-                await channel.send(content=content)
-            
-            self.message_queue.task_done()
+                
+                self.message_queue.task_done()
+                await asyncio.sleep(0.5)
             
         except Exception as e:
             print(f"Failed to send message: {e}")
