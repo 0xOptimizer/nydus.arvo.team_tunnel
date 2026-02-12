@@ -34,8 +34,7 @@ class UsersCog(commands.Cog):
             await ctx.followup.send("No valid IDs found.")
             return
 
-        added_list = []
-        error_list = []
+        added_list, error_list = [], []
 
         async with self._lock:
             for count, user_id in enumerate(user_ids):
@@ -43,21 +42,15 @@ class UsersCog(commands.Cog):
                     target_id = int(user_id)
                     user = self.bot.get_user(target_id) or await self.bot.fetch_user(target_id)
                     
-                    existing = await get_user(str(user.id))
-                    if existing:
+                    if await get_user(str(user.id)):
                         error_list.append(f"{user.mention} is already in the database.")
-                        continue
-
-                    if await add_user(str(user.id), user.name):
+                    elif await add_user(str(user.id), user.name):
                         added_list.append(f"{user.mention} ({user.id})")
-                    else:
-                        error_list.append(f"Database error for {user_id}.")
                     
                     if count % 5 == 0:
                         await asyncio.sleep(0.01)
-
                 except Exception as e:
-                    error_list.append(f"Error processing {user_id}: {str(e)}")
+                    error_list.append(f"Error {user_id}: {str(e)}")
 
         if output_cog:
             for i in range(0, len(added_list), 20):
@@ -76,13 +69,7 @@ class UsersCog(commands.Cog):
 
         output_cog = self.bot.get_cog("OutputCog")
         user_ids = list(set(re.findall(r"\d+", users)))
-
-        if not user_ids:
-            await ctx.followup.send("No valid IDs found.")
-            return
-
-        removed_list = []
-        error_list = []
+        removed_list, error_list = [], []
 
         async with self._lock:
             for count, user_id in enumerate(user_ids):
@@ -90,22 +77,15 @@ class UsersCog(commands.Cog):
                     if await remove_user(str(user_id)):
                         removed_list.append(str(user_id))
                     else:
-                        error_list.append(f"ID {user_id} not found in database.")
-                    
+                        error_list.append(f"ID {user_id} not found.")
                     if count % 10 == 0:
                         await asyncio.sleep(0.01)
                 except Exception as e:
-                    error_list.append(f"Error removing {user_id}: {str(e)}")
+                    error_list.append(f"Error: {str(e)}")
 
         if output_cog:
-            if removed_list:
-                for i in range(0, len(removed_list), 20):
-                    await output_cog.send_embed(
-                        "Access Revoked", 
-                        f"Removed IDs:\n{', '.join(removed_list[i:i + 20])}", 
-                        discord.Color.red()
-                    )
-            
+            for i in range(0, len(removed_list), 20):
+                await output_cog.send_embed("Access Revoked", f"Removed IDs:\n{', '.join(removed_list[i:i + 20])}", discord.Color.red())
             if error_list:
                 for i in range(0, len(error_list), 10):
                     await output_cog.queue_message("\n".join(error_list[i:i + 10]), "ERROR")

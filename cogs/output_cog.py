@@ -5,16 +5,10 @@ import os
 import json
 from datetime import datetime
 
-class DateTimeEncoder(json.JSONEncoder):
-    def default(self, obj):
-        if isinstance(obj, datetime):
-            return obj.isoformat()
-        return super().default(obj)
-
 class OutputView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
-        self.add_item(discord.ui.Button(label="Access the Nydus", url="https://nydus.arvo.team"))
+        self.add_item(discord.ui.Button(label="Click here to access the Nydus", url="https://nydus.arvo.team"))
 
 class OutputCog(commands.Cog):
     def __init__(self, bot):
@@ -35,28 +29,22 @@ class OutputCog(commands.Cog):
         self.process_queue.cancel()
 
     async def send_embed(self, title, description, color, fields=None):
-        embed = discord.Embed(title=title, description=description, color=color)
+        embed = discord.Embed(title=str(title), description=str(description), color=color)
         if fields:
             for name, value in fields.items():
-                embed.add_field(name=name, value=value, inline=False)
+                embed.add_field(name=str(name), value=str(value), inline=False)
         embed.set_footer(text="https://nydus.arvo.team • Nydus Tunnel Network")
         
         await self.message_queue.put((None, embed))
 
     async def queue_message(self, message, msg_type="INFO"):
-        prefixes = {
-            "ERROR": "",
-            "SUCCESS": "",
-            "INFO": ""
-        }
-        
-        if isinstance(message, (dict, list)):
+        if not isinstance(message, str):
             try:
-                message = json.dumps(message, cls=DateTimeEncoder, indent=2)
+                message = json.dumps(message, default=str)
             except Exception:
                 message = str(message)
 
-        content = f"{prefixes.get(msg_type, '')}{message}"
+        content = f"**{msg_type}**: {message}"
         await self.message_queue.put((content, None))
 
     @tasks.loop(seconds=0.5)
@@ -66,26 +54,19 @@ class OutputCog(commands.Cog):
 
         try:
             content, embed = await self.message_queue.get()
-
-            dispatch_tasks = []
-            for channel_id in self.channel_ids:
-                dispatch_tasks.append(self.dispatch_message(channel_id, content, embed))
-            
+            dispatch_tasks = [self.dispatch_message(cid, content, embed) for cid in self.channel_ids]
             if dispatch_tasks:
                 await asyncio.gather(*dispatch_tasks)
-            
             self.message_queue.task_done()
-        except Exception as e:
-            print(f"Internal Queue Error: {e}")
+        except Exception:
+            pass
 
     async def dispatch_message(self, channel_id, content, embed):
         try:
             target_id = int(channel_id)
             channel = self.bot.get_channel(target_id) or await self.bot.fetch_channel(target_id)
-            
             if channel:
-                view = OutputView()
-                await channel.send(content=content, embed=embed, view=view)
+                await channel.send(content=content, embed=embed, view=OutputView())
         except Exception:
             pass
 
