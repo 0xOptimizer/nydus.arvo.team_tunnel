@@ -10,7 +10,7 @@ class UsersCog(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
         self.dev_id = int(os.environ.get("DEV_ID", 0))
-        self.role_id = int(os.environ.get("ROLE_AUTHENTICATED_NYDUS", 1472305983815549032))
+        self.role_id = int(os.environ.get("DISCORD_ROLE_AUTHENTICATED_NYDUS", 1472305983815549032))
         self._lock = asyncio.Lock()
         self._id_cache = set()
 
