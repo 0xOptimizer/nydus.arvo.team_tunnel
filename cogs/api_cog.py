@@ -12,7 +12,8 @@ from database.db import (
     get_project_by_uuid, 
     get_all_projects, 
     create_new_project, 
-    delete_project
+    delete_project,
+    get_user
 )
 
 class ApiCog(commands.Cog):
@@ -31,12 +32,13 @@ class ApiCog(commands.Cog):
         self.start_server.cancel()
 
     def setup_routes(self):
+        self.app.router.add_options('/{tail:.*}', self.handle_options)
+        self.app.router.add_post('/api/auth/check-user', self.handle_check_user)
         self.app.router.add_get('/api/stats', self.handle_get_stats)
         self.app.router.add_get('/api/projects', self.handle_get_projects)
         self.app.router.add_post('/api/projects', self.handle_create_project)
         self.app.router.add_delete('/api/projects/{uuid}', self.handle_delete_project)
         self.app.router.add_post('/webhook/{uuid}', self.handle_webhook)
-        self.app.router.add_options('/{tail:.*}', self.handle_options)
 
     @tasks.loop(count=1)
     async def start_server(self):
@@ -55,6 +57,27 @@ class ApiCog(commands.Cog):
             'Access-Control-Allow-Methods': 'GET, POST, DELETE, OPTIONS',
             'Access-Control-Allow-Headers': 'Content-Type'
         })
+
+    async def handle_check_user(self, request):
+        try:
+            data = await request.json()
+            discord_id = data.get('discord_id')
+            
+            if not discord_id:
+                return web.json_response({'error': 'Missing discord_id'}, status=400)
+
+            user = await get_user(discord_id)
+            
+            if user:
+                return web.json_response({'exists': True}, headers={'Access-Control-Allow-Origin': '*'})
+            
+            return web.json_response({'error': 'User not found'}, status=401, headers={'Access-Control-Allow-Origin': '*'})
+            
+        except json.JSONDecodeError:
+             return web.json_response({'error': 'Invalid JSON'}, status=400)
+        except Exception as e:
+            self.logger.error(f"Auth Check Error: {e}")
+            return web.json_response({'error': 'Internal Server Error'}, status=500)
 
     async def handle_get_stats(self, request):
         try:
@@ -87,7 +110,8 @@ class ApiCog(commands.Cog):
                 branch=data.get('branch', 'main'),
                 tech_stack=data.get('tech_stack', 'html'),
                 subdomain=subdomain,
-                cloudflare_id=cf_record_id
+                cloudflare_id=cf_record_id,
+                nginx_port=data.get('nginx_port', 0)
             )
             return web.json_response(result, status=201, headers={'Access-Control-Allow-Origin': '*'})
 
