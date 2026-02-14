@@ -131,10 +131,8 @@ class ApiCog(commands.Cog):
                 cloudflare_id=cf_record_id,
                 nginx_port=data.get('nginx_port', 0)
             )
-            await self._log_to_discord("Deployment Created", f"New deployment project created: {name}\nUUID: {result.get('webhook_uuid')}", discord.Color.green())
             return web.json_response(result, status=201, headers={'Access-Control-Allow-Origin': '*'})
         except Exception as e:
-            await self._log_to_discord("API Error", f"Failed to create deployment: {str(e)}", discord.Color.red())
             return web.json_response({'error': str(e)}, status=500)
 
     async def handle_delete_deployment(self, request):
@@ -145,7 +143,6 @@ class ApiCog(commands.Cog):
             if cf_cog:
                 await cf_cog.delete_dns_record(project['cloudflare_record_id'])
         await delete_webhook_project(uuid)
-        await self._log_to_discord("Deployment Deleted", f"Deployment project {uuid} has been removed.", discord.Color.orange())
         return web.json_response({'status': 'deleted'}, headers={'Access-Control-Allow-Origin': '*'})
 
     # ------------------------------
@@ -170,7 +167,6 @@ class ApiCog(commands.Cog):
                 visibility=data.get('visibility', 'public'),
                 branch=data.get('branch', 'main')
             )
-            await self._log_to_discord("GitHub Project Added", f"Registered new GitHub project: {data.get('name')}", discord.Color.blue())
             return web.json_response({'uuid': project_uuid}, status=201, headers={'Access-Control-Allow-Origin': '*'})
         except Exception as e:
             return web.json_response({'error': str(e)}, status=500)
@@ -178,7 +174,6 @@ class ApiCog(commands.Cog):
     async def handle_delete_github_project(self, request):
         uuid = request.match_info['uuid']
         await remove_github_project(uuid)
-        await self._log_to_discord("GitHub Project Removed", f"Removed GitHub project record: {uuid}", discord.Color.red())
         return web.json_response({'status': 'deleted'}, headers={'Access-Control-Allow-Origin': '*'})
 
     # ------------------------------
