@@ -10,6 +10,7 @@ class UsersCog(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
         self.dev_id = int(os.environ.get("DEV_ID", 0))
+        self.role_id = 1472305983815549032
         self._lock = asyncio.Lock()
         self._id_cache = set()
 
@@ -29,6 +30,7 @@ class UsersCog(commands.Cog):
         output_cog = self.bot.get_cog("OutputCog")
         user_ids = list(set(re.findall(r"\d+", users)))
         added_list, error_list = [], []
+        role = ctx.guild.get_role(self.role_id)
 
         async with self._lock:
             for count, user_id in enumerate(user_ids):
@@ -46,6 +48,14 @@ class UsersCog(commands.Cog):
                     elif await add_user(str_id, user.name):
                         self._id_cache.add(str_id)
                         added_list.append(f"{user.mention} ({user.id})")
+
+                        if role:
+                            try:
+                                member = ctx.guild.get_member(target_id) or await ctx.guild.fetch_member(target_id)
+                                if member:
+                                    await member.add_roles(role)
+                            except discord.HTTPException:
+                                pass
                     
                     if count % 5 == 0 and count > 0:
                         await asyncio.sleep(0.05)
@@ -70,20 +80,29 @@ class UsersCog(commands.Cog):
         output_cog = self.bot.get_cog("OutputCog")
         user_ids = list(set(re.findall(r"\d+", users)))
         removed_list, error_list = [], []
+        role = ctx.guild.get_role(self.role_id)
 
         async with self._lock:
             for count, user_id in enumerate(user_ids):
                 try:
                     str_id = str(user_id)
+                    target_id = int(user_id)
                     
                     success = await remove_user(str_id)
-                    
                     if not success:
-                        success = await remove_user(int(user_id))
+                        success = await remove_user(target_id)
 
                     if success:
                         self._id_cache.discard(str_id)
                         removed_list.append(str_id)
+
+                        if role:
+                            try:
+                                member = ctx.guild.get_member(target_id) or await ctx.guild.fetch_member(target_id)
+                                if member:
+                                    await member.remove_roles(role)
+                            except (discord.NotFound, discord.HTTPException):
+                                pass
                     else:
                         error_list.append(f"ID {user_id} not found.")
                     
