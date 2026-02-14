@@ -7,7 +7,7 @@ import json
 class OutputView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
-        self.add_item(discord.ui.Button(label="Access the Nydus", url="https://nydus.arvo.team"))
+        self.add_item(discord.ui.Button(label="Access Nydus via browser", url="https://nydus.arvo.team", style=discord.ButtonStyle.success))
 
 class OutputCog(commands.Cog):
     def __init__(self, bot):
@@ -26,12 +26,28 @@ class OutputCog(commands.Cog):
     def cog_unload(self):
         self.process_queue.cancel()
 
-    async def send_embed(self, title, description, color, fields=None):
+    async def send_embed(self, title, description, color=discord.Color.default(), fields=None, thumbnail=None, image=None, author_name=None, author_icon=None, footer_text=None):
         embed = discord.Embed(title=str(title), description=str(description), color=color)
+        
+        if author_name:
+            embed.set_author(name=str(author_name), icon_url=author_icon)
+        
+        if thumbnail:
+            embed.set_thumbnail(url=thumbnail)
+            
+        if image:
+            embed.set_image(url=image)
+
         if fields:
             for name, value in fields.items():
                 embed.add_field(name=str(name), value=str(value), inline=False)
-        embed.set_footer(text="https://nydus.arvo.team • Nydus Tunnel Network")
+        
+        link = "https://nydus.arvo.team"
+        if footer_text:
+            embed.set_footer(text=f"{footer_text}")
+        else:
+            embed.set_footer(text=f"Sent from {link}")
+            
         await self.message_queue.put((None, embed))
 
     async def queue_message(self, message, msg_type="INFO"):
