@@ -10,7 +10,7 @@ class MaintenanceCog(commands.Cog):
         self.logger = logging.getLogger('nydus')
         # PATHS
         self.arvo_path = "/var/www/arvo.team"
-        self.nydus_ui_path = "/var/www/nydus.arvo.team"
+        self.nydus_ui_path = "/var/www/nydus"
         self.bot_path = "/opt/nydus"
 
     async def _run_command(self, cmd, cwd=None):
