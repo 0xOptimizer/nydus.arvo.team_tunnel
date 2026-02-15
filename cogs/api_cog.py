@@ -5,7 +5,6 @@ import hmac
 import hashlib
 import json
 import logging
-import traceback
 import asyncio
 import discord
 from database.db import (
@@ -15,7 +14,6 @@ from database.db import (
     create_new_webhook_project, 
     delete_webhook_project,
     add_github_project,
-    get_github_project,
     get_all_github_projects,
     remove_github_project,
     get_user
@@ -31,7 +29,7 @@ class ApiCog(commands.Cog):
         self.port = int(os.getenv('PORT', 4000))
         self.logger = logging.getLogger('nydus')
         self.start_server.start()
-        self.server_ip = os.getenv('SERVER_IP', '127.0.0.1') 
+        self.server_ip = os.getenv('SERVER_IP', '127.0.0.1')
 
     def cog_unload(self):
         self.start_server.cancel()
@@ -47,6 +45,8 @@ class ApiCog(commands.Cog):
         self.app.router.add_post('/api/github-projects', self.handle_create_github_project)
         self.app.router.add_delete('/api/github-projects/{uuid}', self.handle_delete_github_project)
         self.app.router.add_post('/webhook/{uuid}', self.handle_webhook)
+        self.app.router.add_get('/api/maintenance/logs/{service}', self.handle_get_logs)
+        self.app.router.add_get('/api/maintenance/restart/{service}', self.handle_restart_service)
 
     @tasks.loop(count=1)
     async def start_server(self):
@@ -175,6 +175,38 @@ class ApiCog(commands.Cog):
         uuid = request.match_info['uuid']
         await remove_github_project(uuid)
         return web.json_response({'status': 'deleted'}, headers={'Access-Control-Allow-Origin': '*'})
+
+    # ------------------------------
+    # MAINTENANCE
+    # ------------------------------
+
+    async def handle_get_logs(self, request):
+        service = request.match_info['service']
+        cog = self.bot.get_cog('MaintenanceCog')
+        if not cog:
+            return web.json_response({'error': 'Maintenance module unavailable'}, status=503)
+        success, output = await cog.get_service_logs(service)
+        if not success:
+            return web.json_response({'error': output}, status=400, headers={'Access-Control-Allow-Origin': '*'})
+        return web.json_response({'logs': output}, headers={'Access-Control-Allow-Origin': '*'})
+
+    async def handle_restart_service(self, request):
+        service = request.match_info['service']
+        cog = self.bot.get_cog('MaintenanceCog')
+        if not cog:
+            return web.json_response({'error': 'Maintenance module unavailable'}, status=503)
+        response = web.StreamResponse(status=200, headers={
+            'Content-Type': 'text/event-stream',
+            'Cache-Control': 'no-cache',
+            'Connection': 'keep-alive',
+            'Access-Control-Allow-Origin': '*'
+        })
+        await response.prepare(request)
+        async for update in cog.run_maintenance_stream(service):
+            await response.write(f"data: {json.dumps(update)}\n\n".encode('utf-8'))
+            if update.get('done'):
+                break
+        return response
 
     # ------------------------------
     # WEBHOOKS
