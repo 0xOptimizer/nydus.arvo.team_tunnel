@@ -25,7 +25,8 @@ cogs_list = [
     'cogs.nginx_cog',
     'cogs.deployment_cog',
     'cogs.api_cog',
-    'cogs.users_cog'
+    'cogs.users_cog',
+    'cogs.maintenance_cog'
 ]
 
 @bot.event
