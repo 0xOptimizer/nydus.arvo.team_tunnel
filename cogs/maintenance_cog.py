@@ -8,7 +8,9 @@ class MaintenanceCog(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
         self.logger = logging.getLogger('nydus')
-        self.nextjs_path = "/var/www/nydus.arvo.team"
+        # PATHS
+        self.arvo_path = "/var/www/arvo.team"
+        self.nydus_ui_path = "/var/www/nydus.arvo.team"
         self.bot_path = "/opt/nydus"
 
     async def _run_command(self, cmd, cwd=None):
@@ -32,6 +34,8 @@ class MaintenanceCog(commands.Cog):
         cmd = ""
         if service == 'nginx':
             cmd = "tail -n 100 /var/log/nginx/error.log"
+        elif service == 'arvo-team':
+            cmd = "pm2 logs arvo.team --lines 100 --nostream"
         elif service == 'nydus-ui':
             cmd = "pm2 logs nydus-ui --lines 100 --nostream"
         elif service == 'nydus':
@@ -41,26 +45,53 @@ class MaintenanceCog(commands.Cog):
         return await self._run_command(cmd)
 
     async def run_maintenance_stream(self, service):
+        # ------------------------------
+        # NGINX RESTART
+        # ------------------------------
         if service == 'nginx':
             yield {"status": "progress", "message": "Restarting Nginx service..."}
             success, out = await self._run_command("sudo systemctl restart nginx")
             yield {"status": "success" if success else "error", "message": out, "done": True}
 
-        elif service == 'nydus-ui':
+        # ------------------------------
+        # ARVO.TEAM (NEXT.JS)
+        # ------------------------------
+        elif service == 'arvo-team':
             steps = [
-                ("Pulling latest code...", "git pull"),
+                ("Pulling arvo.team code...", "git pull"),
                 ("Installing dependencies...", "npm install"),
-                ("Building project...", "npm run build"),
-                ("Restarting PM2 process...", "pm2 restart nydus-ui")
+                ("Building arvo.team...", "npm run build"),
+                ("Restarting PM2 (arvo.team)...", "pm2 restart arvo.team")
             ]
             for msg, cmd in steps:
                 yield {"status": "progress", "message": msg}
-                success, out = await self._run_command(cmd, cwd=self.nextjs_path)
+                success, out = await self._run_command(cmd, cwd=self.arvo_path)
                 if not success:
                     yield {"status": "error", "message": f"Failed at: {msg}\n{out}", "done": True}
                     return
-            yield {"status": "success", "message": "nydus-ui updated and rebuilt successfully.", "done": True}
+            yield {"status": "success", "message": "arvo.team updated successfully.", "done": True}
 
+        # ------------------------------
+        # NYDUS-UI (NEXT.JS)
+        # ------------------------------
+        elif service == 'nydus-ui':
+            steps = [
+                ("Pulling nydus.arvo.team code...", "git pull"),
+                ("Installing dependencies...", "npm install"),
+                ("Building nydus-ui...", "npm run build"),
+                ("Restarting PM2 (nydus-ui)...", "pm2 restart nydus-ui")
+            ]
+            for msg, cmd in steps:
+                yield {"status": "progress", "message": msg}
+                success, out = await self._run_command(cmd, cwd=self.nydus_ui_path)
+                if not success:
+                    yield {"status": "error", "message": f"Failed at: {msg}\n{out}", "done": True}
+                    return
+            yield {"status": "success", "message": "nydus-ui updated successfully.", "done": True}
+
+        # ------------------------------
+        # NYDUS BOT (PYTHON)
+        # ------------------------------
         elif service == 'nydus':
             yield {"status": "progress", "message": "Initiating Bot Pull & Restart..."}
             yield {"status": "success", "message": "Restarting systemd service. Connection will drop.", "done": True}
