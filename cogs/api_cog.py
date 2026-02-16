@@ -129,6 +129,11 @@ class ApiCog(commands.Cog):
     async def handle_create_github_project(self, request):
         try:
             data = await request.json()
+            
+            owner_id = data.get('owner_discord_id')
+            if not owner_id:
+                return web.json_response({'error': 'Missing owner_discord_id'}, status=400)
+
             project_uuid = await add_github_project(
                 name=data.get('name'),
                 owner=data.get('owner'),
@@ -138,7 +143,8 @@ class ApiCog(commands.Cog):
                 git_url=data.get('git_url'),
                 ssh_url=data.get('ssh_url'),
                 visibility=data.get('visibility', 'public'),
-                branch=data.get('branch', 'main')
+                branch=data.get('branch', 'main'),
+                owner_discord_id=owner_id 
             )
             return web.json_response({'uuid': project_uuid}, status=201, headers={'Access-Control-Allow-Origin': '*'})
         except Exception as e:
