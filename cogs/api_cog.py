@@ -163,7 +163,17 @@ class ApiCog(commands.Cog):
     # ------------------------------
 
     async def handle_get_attached_projects(self, request):
-        projects = await get_all_attached_projects()
+        # Extract the ID from the query parameters (?owner_discord_id=...)
+        owner_id = request.query.get('owner_discord_id')
+        
+        if not owner_id:
+            return web.json_response({'error': 'Missing owner_discord_id parameter'}, status=400)
+
+        projects = await get_all_attached_projects(owner_id)
+        
+        if projects is None:
+            return web.json_response([], headers={'Access-Control-Allow-Origin': '*'})
+            
         return web.json_response(projects, headers={'Access-Control-Allow-Origin': '*'})
     
     # ------------------------------
