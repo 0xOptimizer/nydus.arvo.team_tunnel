@@ -7,6 +7,7 @@ import json
 import logging
 import asyncio
 import discord
+from datetime import datetime
 from database.db import (
     get_recent_usage, 
     get_webhook_project_by_uuid, 
@@ -19,6 +20,11 @@ from database.db import (
     remove_github_project,
     get_user
 )
+
+def json_serial(obj):
+    if isinstance(obj, datetime):
+        return obj.isoformat()
+    raise TypeError(f"Type {type(obj)} not serializable")
 
 class ApiCog(commands.Cog):
     def __init__(self, bot):
@@ -80,6 +86,14 @@ class ApiCog(commands.Cog):
                 color=color
             )
 
+    def json_response(self, data, status=200):
+        return web.json_response(
+            data,
+            status=status,
+            headers={'Access-Control-Allow-Origin': '*'},
+            dumps=lambda obj: json.dumps(obj, default=json_serial)
+        )
+
     async def handle_options(self, request):
         return web.Response(status=200, headers={
             'Access-Control-Allow-Origin': '*',
@@ -96,13 +110,13 @@ class ApiCog(commands.Cog):
             data = await request.json()
             discord_id = data.get('discord_id')
             if not discord_id:
-                return web.json_response({'error': 'Missing discord_id'}, status=400)
+                return self.json_response({'error': 'Missing discord_id'}, status=400)
             user = await get_user(discord_id)
             if user:
-                return web.json_response({'exists': True}, headers={'Access-Control-Allow-Origin': '*'})
-            return web.json_response({'error': 'User not found'}, status=401, headers={'Access-Control-Allow-Origin': '*'})
+                return self.json_response({'exists': True})
+            return self.json_response({'error': 'User not found'}, status=401)
         except Exception:
-            return web.json_response({'error': 'Internal Server Error'}, status=500)
+            return self.json_response({'error': 'Internal Server Error'}, status=500)
 
     # ------------------------------
     # STATISTICS
@@ -111,9 +125,9 @@ class ApiCog(commands.Cog):
     async def handle_get_stats(self, request):
         try:
             stats = await get_recent_usage(limit=1)
-            return web.json_response(stats, headers={'Access-Control-Allow-Origin': '*'})
+            return self.json_response(stats)
         except Exception as e:
-            return web.json_response({'error': str(e)}, status=500)
+            return self.json_response({'error': str(e)}, status=500)
 
     # ------------------------------
     # DEPLOYMENTS
@@ -127,7 +141,7 @@ class ApiCog(commands.Cog):
 
     async def handle_get_github_projects(self, request):
         projects = await get_all_github_projects()
-        return web.json_response(projects, headers={'Access-Control-Allow-Origin': '*'})
+        return self.json_response(projects)
 
     async def handle_create_github_project(self, request):
         try:
@@ -135,7 +149,7 @@ class ApiCog(commands.Cog):
             
             owner_id = data.get('owner_discord_id')
             if not owner_id:
-                return web.json_response({'error': 'Missing owner_discord_id'}, status=400)
+                return self.json_response({'error': 'Missing owner_discord_id'}, status=400)
 
             project_uuid = await add_github_project(
                 name=data.get('name'),
@@ -149,32 +163,34 @@ class ApiCog(commands.Cog):
                 branch=data.get('branch', 'main'),
                 owner_discord_id=owner_id 
             )
-            return web.json_response({'uuid': project_uuid}, status=201, headers={'Access-Control-Allow-Origin': '*'})
+            return self.json_response({'uuid': project_uuid}, status=201)
         except Exception as e:
-            return web.json_response({'error': str(e)}, status=500)
-
-    async def handle_delete_github_project(self, request):
-        uuid = request.match_info['uuid']
-        await remove_github_project(uuid)
-        return web.json_response({'status': 'deleted'}, headers={'Access-Control-Allow-Origin': '*'})
-
-    # ------------------------------
-    # ATTACHED PROJECTS
-    # ------------------------------
+            return self.json_response({'error': str(e)}, status=500)
 
     async def handle_get_attached_projects(self, request):
         # Extract the ID from the query parameters (?owner_discord_id=...)
         owner_id = request.query.get('owner_discord_id')
         
         if not owner_id:
-            return web.json_response({'error': 'Missing owner_discord_id parameter'}, status=400)
+            return self.json_response({'error': 'Missing owner_discord_id parameter'}, status=400)
 
         projects = await get_all_attached_projects(owner_id)
         
         if projects is None:
-            return web.json_response([], headers={'Access-Control-Allow-Origin': '*'})
+            return self.json_response([])
             
-        return web.json_response(projects, headers={'Access-Control-Allow-Origin': '*'})
+        return self.json_response(projects)
+
+    async def handle_delete_github_project(self, request):
+        uuid = request.match_info['uuid']
+        await remove_github_project(uuid)
+        return self.json_response({'status': 'deleted'})
+
+    # ------------------------------
+    # ATTACHED PROJECTS
+    # ------------------------------
+
+    # Note: Handled by handle_get_attached_projects above
     
     # ------------------------------
     # MAINTENANCE
@@ -184,17 +200,17 @@ class ApiCog(commands.Cog):
         service = request.match_info['service']
         cog = self.bot.get_cog('MaintenanceCog')
         if not cog:
-            return web.json_response({'error': 'Maintenance module unavailable'}, status=503)
+            return self.json_response({'error': 'Maintenance module unavailable'}, status=503)
         success, output = await cog.get_service_logs(service)
         if not success:
-            return web.json_response({'error': output}, status=400, headers={'Access-Control-Allow-Origin': '*'})
-        return web.json_response({'logs': output}, headers={'Access-Control-Allow-Origin': '*'})
+            return self.json_response({'error': output}, status=400)
+        return self.json_response({'logs': output})
 
     async def handle_restart_service(self, request):
         service = request.match_info['service']
         cog = self.bot.get_cog('MaintenanceCog')
         if not cog:
-            return web.json_response({'error': 'Maintenance module unavailable'}, status=503)
+            return self.json_response({'error': 'Maintenance module unavailable'}, status=503)
         response = web.StreamResponse(status=200, headers={
             'Content-Type': 'text/event-stream',
             'Cache-Control': 'no-cache',
@@ -216,21 +232,21 @@ class ApiCog(commands.Cog):
         uuid = request.match_info['uuid']
         project = await get_webhook_project_by_uuid(uuid)
         if not project:
-            return web.json_response({'error': 'Project not found'}, status=404)
+            return self.json_response({'error': 'Project not found'}, status=404)
         signature = request.headers.get('X-Hub-Signature-256')
         body = await request.read()
         secret = project['webhook_secret']
         if not secret:
-            return web.json_response({'error': 'Secret config error'}, status=500)
+            return self.json_response({'error': 'Secret config error'}, status=500)
         hash_obj = hmac.new(secret.encode(), msg=body, digestmod=hashlib.sha256)
         expected = "sha256=" + hash_obj.hexdigest()
         if not signature or not hmac.compare_digest(expected, signature):
-            return web.json_response({'error': 'Invalid signature'}, status=401)
+            return self.json_response({'error': 'Invalid signature'}, status=401)
         deployer = self.bot.get_cog('DeploymentCog')
         if deployer:
             asyncio.create_task(deployer.deploy_project(project))
-            return web.json_response({'status': 'queued'})
-        return web.json_response({'error': 'Deployment module unavailable'}, status=500)
+            return self.json_response({'status': 'queued'})
+        return self.json_response({'error': 'Deployment module unavailable'}, status=500)
 
     # ------------------------------
     # CLOUDFLARE
@@ -239,7 +255,7 @@ class ApiCog(commands.Cog):
     async def handle_get_dns_records(self, request):
         cf_cog = self.bot.get_cog('CloudflareCog')
         if not cf_cog:
-            return web.json_response({'error': 'Cloudflare module unavailable'}, status=503)
+            return self.json_response({'error': 'Cloudflare module unavailable'}, status=503)
 
         type_filter = request.query.get('type')
         name_filter = request.query.get('name')
@@ -252,14 +268,14 @@ class ApiCog(commands.Cog):
         data, error = await cf_cog.list_dns_records(type=type_filter, name=name_filter, page=page)
         
         if error:
-            return web.json_response({'error': error}, status=400, headers={'Access-Control-Allow-Origin': '*'})
+            return self.json_response({'error': error}, status=400)
         
-        return web.json_response(data, headers={'Access-Control-Allow-Origin': '*'})
+        return self.json_response(data)
 
     async def handle_create_dns_record(self, request):
         cf_cog = self.bot.get_cog('CloudflareCog')
         if not cf_cog:
-            return web.json_response({'error': 'Cloudflare module unavailable'}, status=503)
+            return self.json_response({'error': 'Cloudflare module unavailable'}, status=503)
 
         try:
             data = await request.json()
@@ -272,7 +288,7 @@ class ApiCog(commands.Cog):
             comment = data.get('comment', '')
 
             if not name or not content:
-                return web.json_response({'error': 'Name and Content are required'}, status=400)
+                return self.json_response({'error': 'Name and Content are required'}, status=400)
 
             result, error = await cf_cog.create_dns_record(
                 type=record_type,
@@ -284,16 +300,16 @@ class ApiCog(commands.Cog):
             )
 
             if error:
-                return web.json_response({'error': error}, status=400, headers={'Access-Control-Allow-Origin': '*'})
+                return self.json_response({'error': error}, status=400)
             
-            return web.json_response(result, status=201, headers={'Access-Control-Allow-Origin': '*'})
+            return self.json_response(result, status=201)
         except Exception as e:
-            return web.json_response({'error': str(e)}, status=500)
+            return self.json_response({'error': str(e)}, status=500)
 
     async def handle_update_dns_record(self, request):
         cf_cog = self.bot.get_cog('CloudflareCog')
         if not cf_cog:
-            return web.json_response({'error': 'Cloudflare module unavailable'}, status=503)
+            return self.json_response({'error': 'Cloudflare module unavailable'}, status=503)
 
         record_id = request.match_info['record_id']
         
@@ -317,24 +333,24 @@ class ApiCog(commands.Cog):
             )
 
             if error:
-                return web.json_response({'error': error}, status=400, headers={'Access-Control-Allow-Origin': '*'})
+                return self.json_response({'error': error}, status=400)
             
-            return web.json_response(result, headers={'Access-Control-Allow-Origin': '*'})
+            return self.json_response(result)
         except Exception as e:
-            return web.json_response({'error': str(e)}, status=500)
+            return self.json_response({'error': str(e)}, status=500)
 
     async def handle_delete_dns_record(self, request):
         cf_cog = self.bot.get_cog('CloudflareCog')
         if not cf_cog:
-            return web.json_response({'error': 'Cloudflare module unavailable'}, status=503)
+            return self.json_response({'error': 'Cloudflare module unavailable'}, status=503)
 
         record_id = request.match_info['record_id']
         success, error = await cf_cog.delete_dns_record(record_id)
 
         if error:
-            return web.json_response({'error': error}, status=400, headers={'Access-Control-Allow-Origin': '*'})
+            return self.json_response({'error': error}, status=400)
         
-        return web.json_response({'status': 'deleted'}, headers={'Access-Control-Allow-Origin': '*'})
+        return self.json_response({'status': 'deleted'})
 
 def setup(bot):
     bot.add_cog(ApiCog(bot))
