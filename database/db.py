@@ -133,12 +133,12 @@ async def delete_webhook_project(uuid):
         (uuid,)
     )
 
-async def add_github_project(name, owner, owner_type, description, url_path, git_url, ssh_url, visibility, branch):
+async def add_github_project(name, owner, owner_discord_id, owner_type, description, url_path, git_url, ssh_url, visibility, branch):
     new_uuid = str(uuid.uuid4())
     query = """INSERT INTO projects 
-               (project_uuid, name, owner_login, owner_type, description, url_path, git_url, ssh_url, visibility, default_branch)
-               VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)"""
-    params = (new_uuid, name, owner, owner_type, description, url_path, git_url, ssh_url, visibility, branch)
+               (project_uuid, name, owner_login, owner_discord_id, owner_type, description, url_path, git_url, ssh_url, visibility, default_branch)
+               VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)"""
+    params = (new_uuid, name, owner, owner_discord_id, owner_type, description, url_path, git_url, ssh_url, visibility, branch)
     result = await execute_query(query, params)
     return new_uuid if result else None
 
