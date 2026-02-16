@@ -161,6 +161,13 @@ async def remove_github_project(project_uuid):
         (project_uuid,)
     )
 
+async def get_all_attached_projects(owner_discord_id):
+    return await execute_query(
+        "SELECT * FROM projects WHERE owner_discord_id = %s",
+        (owner_discord_id,),
+        fetch_all=True
+    )
+
 async def add_user(discord_id, username=None):
     new_uuid = str(uuid.uuid4())
     return await execute_query(

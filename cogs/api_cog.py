@@ -15,6 +15,7 @@ from database.db import (
     delete_webhook_project,
     add_github_project,
     get_all_github_projects,
+    get_all_attached_projects,
     remove_github_project,
     get_user
 )
@@ -51,6 +52,8 @@ class ApiCog(commands.Cog):
         self.app.router.add_get('/api/github-projects', self.handle_get_github_projects)
         self.app.router.add_post('/api/github-projects', self.handle_create_github_project)
         self.app.router.add_delete('/api/github-projects/{uuid}', self.handle_delete_github_project)
+
+        self.app.router.add_get('/api/attached-projects', self.handle_get_attached_projects)
 
         self.app.router.add_post('/webhook/{uuid}', self.handle_webhook)
 
@@ -155,6 +158,14 @@ class ApiCog(commands.Cog):
         await remove_github_project(uuid)
         return web.json_response({'status': 'deleted'}, headers={'Access-Control-Allow-Origin': '*'})
 
+    # ------------------------------
+    # ATTACHED PROJECTS
+    # ------------------------------
+
+    async def handle_get_attached_projects(self, request):
+        projects = await get_all_attached_projects()
+        return web.json_response(projects, headers={'Access-Control-Allow-Origin': '*'})
+    
     # ------------------------------
     # MAINTENANCE
     # ------------------------------
