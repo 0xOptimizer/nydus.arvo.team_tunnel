@@ -38,13 +38,22 @@ class ApiCog(commands.Cog):
         self.app.router.add_options('/{tail:.*}', self.handle_options)
         self.app.router.add_post('/api/auth/check-user', self.handle_check_user)
         self.app.router.add_get('/api/stats', self.handle_get_stats)
-        self.app.router.add_get('/api/deployments', self.handle_get_deployments)
-        self.app.router.add_post('/api/deployments', self.handle_create_deployment)
-        self.app.router.add_delete('/api/deployments/{uuid}', self.handle_delete_deployment)
+
+        self.app.router.add_get('/api/cloudflare/records', self.handle_get_dns_records)
+        self.app.router.add_post('/api/cloudflare/records', self.handle_create_dns_record)
+        self.app.router.add_put('/api/cloudflare/records/{record_id}', self.handle_update_dns_record)
+        self.app.router.add_delete('/api/cloudflare/records/{record_id}', self.handle_delete_dns_record)
+
+        # self.app.router.add_get('/api/deployments', self.handle_get_deployments)
+        # self.app.router.add_post('/api/deployments', self.handle_create_deployment)
+        # self.app.router.add_delete('/api/deployments/{uuid}', self.handle_delete_deployment)
+
         self.app.router.add_get('/api/github-projects', self.handle_get_github_projects)
         self.app.router.add_post('/api/github-projects', self.handle_create_github_project)
         self.app.router.add_delete('/api/github-projects/{uuid}', self.handle_delete_github_project)
+
         self.app.router.add_post('/webhook/{uuid}', self.handle_webhook)
+
         self.app.router.add_get('/api/maintenance/logs/{service}', self.handle_get_logs)
         self.app.router.add_get('/api/maintenance/restart/{service}', self.handle_restart_service)
 
@@ -107,43 +116,7 @@ class ApiCog(commands.Cog):
     # DEPLOYMENTS
     # ------------------------------
 
-    async def handle_get_deployments(self, request):
-        projects = await get_all_webhook_projects()
-        return web.json_response(projects, headers={'Access-Control-Allow-Origin': '*'})
-
-    async def handle_create_deployment(self, request):
-        try:
-            data = await request.json()
-            name = data.get('project_name')
-            subdomain = data.get('subdomain')
-            cf_cog = self.bot.get_cog('CloudflareCog')
-            cf_record_id = None
-            if cf_cog and subdomain:
-                cf_record_id, error = await cf_cog.create_dns_record(subdomain, self.server_ip)
-                if error:
-                    return web.json_response({'error': f'DNS Error: {error}'}, status=400)
-            result = await create_new_webhook_project(
-                name=name,
-                repo_url=data.get('github_repository_url'),
-                branch=data.get('branch', 'main'),
-                tech_stack=data.get('tech_stack', 'html'),
-                subdomain=subdomain,
-                cloudflare_id=cf_record_id,
-                nginx_port=data.get('nginx_port', 0)
-            )
-            return web.json_response(result, status=201, headers={'Access-Control-Allow-Origin': '*'})
-        except Exception as e:
-            return web.json_response({'error': str(e)}, status=500)
-
-    async def handle_delete_deployment(self, request):
-        uuid = request.match_info['uuid']
-        project = await get_webhook_project_by_uuid(uuid)
-        if project and project['cloudflare_record_id']:
-            cf_cog = self.bot.get_cog('CloudflareCog')
-            if cf_cog:
-                await cf_cog.delete_dns_record(project['cloudflare_record_id'])
-        await delete_webhook_project(uuid)
-        return web.json_response({'status': 'deleted'}, headers={'Access-Control-Allow-Origin': '*'})
+    
 
     # ------------------------------
     # REPOSITORIES
@@ -231,6 +204,110 @@ class ApiCog(commands.Cog):
             asyncio.create_task(deployer.deploy_project(project))
             return web.json_response({'status': 'queued'})
         return web.json_response({'error': 'Deployment module unavailable'}, status=500)
+
+    # ------------------------------
+    # CLOUDFLARE
+    # ------------------------------
+
+    async def handle_get_dns_records(self, request):
+        cf_cog = self.bot.get_cog('CloudflareCog')
+        if not cf_cog:
+            return web.json_response({'error': 'Cloudflare module unavailable'}, status=503)
+
+        type_filter = request.query.get('type')
+        name_filter = request.query.get('name')
+        # Default to page 1 if not provided
+        try:
+            page = int(request.query.get('page', 1))
+        except ValueError:
+            page = 1
+
+        data, error = await cf_cog.list_dns_records(type=type_filter, name=name_filter, page=page)
+        
+        if error:
+            return web.json_response({'error': error}, status=400, headers={'Access-Control-Allow-Origin': '*'})
+        
+        return web.json_response(data, headers={'Access-Control-Allow-Origin': '*'})
+
+    async def handle_create_dns_record(self, request):
+        cf_cog = self.bot.get_cog('CloudflareCog')
+        if not cf_cog:
+            return web.json_response({'error': 'Cloudflare module unavailable'}, status=503)
+
+        try:
+            data = await request.json()
+            # Extract fields with defaults matching Cloudflare API
+            record_type = data.get('type', 'A')
+            name = data.get('name')
+            content = data.get('content')
+            ttl = int(data.get('ttl', 1))
+            proxied = data.get('proxied', True)
+            comment = data.get('comment', '')
+
+            if not name or not content:
+                return web.json_response({'error': 'Name and Content are required'}, status=400)
+
+            result, error = await cf_cog.create_dns_record(
+                type=record_type,
+                name=name,
+                content=content,
+                ttl=ttl,
+                proxied=proxied,
+                comment=comment
+            )
+
+            if error:
+                return web.json_response({'error': error}, status=400, headers={'Access-Control-Allow-Origin': '*'})
+            
+            return web.json_response(result, status=201, headers={'Access-Control-Allow-Origin': '*'})
+        except Exception as e:
+            return web.json_response({'error': str(e)}, status=500)
+
+    async def handle_update_dns_record(self, request):
+        cf_cog = self.bot.get_cog('CloudflareCog')
+        if not cf_cog:
+            return web.json_response({'error': 'Cloudflare module unavailable'}, status=503)
+
+        record_id = request.match_info['record_id']
+        
+        try:
+            data = await request.json()
+            record_type = data.get('type', 'A')
+            name = data.get('name')
+            content = data.get('content')
+            ttl = int(data.get('ttl', 1))
+            proxied = data.get('proxied', True)
+            comment = data.get('comment', '')
+
+            result, error = await cf_cog.update_dns_record(
+                record_id=record_id,
+                type=record_type,
+                name=name,
+                content=content,
+                ttl=ttl,
+                proxied=proxied,
+                comment=comment
+            )
+
+            if error:
+                return web.json_response({'error': error}, status=400, headers={'Access-Control-Allow-Origin': '*'})
+            
+            return web.json_response(result, headers={'Access-Control-Allow-Origin': '*'})
+        except Exception as e:
+            return web.json_response({'error': str(e)}, status=500)
+
+    async def handle_delete_dns_record(self, request):
+        cf_cog = self.bot.get_cog('CloudflareCog')
+        if not cf_cog:
+            return web.json_response({'error': 'Cloudflare module unavailable'}, status=503)
+
+        record_id = request.match_info['record_id']
+        success, error = await cf_cog.delete_dns_record(record_id)
+
+        if error:
+            return web.json_response({'error': error}, status=400, headers={'Access-Control-Allow-Origin': '*'})
+        
+        return web.json_response({'status': 'deleted'}, headers={'Access-Control-Allow-Origin': '*'})
 
 def setup(bot):
     bot.add_cog(ApiCog(bot))

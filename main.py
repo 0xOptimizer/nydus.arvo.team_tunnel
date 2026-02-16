@@ -26,7 +26,8 @@ cogs_list = [
     'cogs.deployment_cog',
     'cogs.api_cog',
     'cogs.users_cog',
-    'cogs.maintenance_cog'
+    'cogs.maintenance_cog',
+    'cogs.cloudflare_cog'
 ]
 
 @bot.event
