@@ -50,6 +50,8 @@ class ApiCog(commands.Cog):
         self.app.router.add_post('/api/cloudflare/records', self.handle_create_dns_record)
         self.app.router.add_put('/api/cloudflare/records/{record_id}', self.handle_update_dns_record)
         self.app.router.add_delete('/api/cloudflare/records/{record_id}', self.handle_delete_dns_record)
+        self.app.router.add_get('/api/cloudflare/analytics', self.handle_get_analytics)
+        self.app.router.add_get('/api/cloudflare/dynamic-analytics', self.handle_get_dynamic_analytics)
 
         # self.app.router.add_get('/api/deployments', self.handle_get_deployments)
         # self.app.router.add_post('/api/deployments', self.handle_create_deployment)
@@ -351,6 +353,55 @@ class ApiCog(commands.Cog):
             return self.json_response({'error': error}, status=400)
         
         return self.json_response({'status': 'deleted'})
+
+    async def handle_get_analytics(self, request):
+        try:
+            cf_cog = self.bot.get_cog('CloudflareCog')
+            if not cf_cog:
+                return self.json_response({'error': 'Cloudflare module unavailable'}, status=503)
+
+            days = int(request.query.get('days', 7))
+            stats, error = await cf_cog.get_visitor_stats(days=days)
+            
+            if error:
+                return self.json_response({'error': error}, status=400)
+
+            return self.json_response(stats)
+        except Exception as e:
+            return self.json_response({'error': str(e)}, status=500)
+
+    async def handle_get_dynamic_analytics(self, request):
+        try:
+            days_raw = request.query.get('days', 7)
+            print(f"[API] Received request for Cloudflare analytics. Parameter days: {days_raw}")
+            
+            cf_cog = self.bot.get_cog('CloudflareCog')
+            if not cf_cog:
+                print("[API] ERROR: CloudflareCog not found in bot instance")
+                return self.json_response({'error': 'Cloudflare module unavailable'}, status=503)
+
+            try:
+                days = int(days_raw)
+            except ValueError:
+                print(f"[API] ERROR: Invalid days parameter received: {days_raw}")
+                return self.json_response({'error': 'Invalid days parameter'}, status=400)
+
+            print(f"[API] Calling get_dynamic_analytics for {days} days...")
+            stats, error = await cf_cog.get_dynamic_analytics(days=days)
+            
+            if error:
+                print(f"[API] CloudflareCog returned error: {error}")
+                return self.json_response({'error': error}, status=400)
+
+            data_count = len(stats.get('data', [])) if stats else 0
+            print(f"[API] Success. Returning {data_count} data points. Granularity: {stats.get('granularity')}")
+            return self.json_response(stats)
+            
+        except Exception as e:
+            print(f"[API] CRITICAL EXCEPTION in handle_get_dynamic_analytics: {str(e)}")
+            import traceback
+            traceback.print_exc()
+            return self.json_response({'error': str(e)}, status=500)
 
 def setup(bot):
     bot.add_cog(ApiCog(bot))
