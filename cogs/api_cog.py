@@ -174,8 +174,7 @@ class ApiCog(commands.Cog):
             return self.json_response({'error': str(e)}, status=500)
     
     async def handle_public_status(self, request):
-        is_active = hasattr(self, 'public_server') and self.public_server is not None
-        return self.json_response({'running': is_active})
+        return self.json_response({'running': self.public_enabled})
 
     # ------------------------------
     # COMMON HELPERS
