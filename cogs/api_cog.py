@@ -171,6 +171,9 @@ class ApiCog(commands.Cog):
                 return self.json_response({'error': 'Invalid action, use "start" or "stop"'}, status=400)
         except Exception as e:
             return self.json_response({'error': str(e)}, status=500)
+    async def handle_public_status(self, request):
+        is_active = hasattr(self, 'public_server') and self.public_server is not None
+        return self.json_response({'running': is_active})
 
     # ------------------------------
     # COMMON HELPERS
