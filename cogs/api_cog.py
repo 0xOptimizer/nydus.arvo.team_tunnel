@@ -67,6 +67,7 @@ class ApiCog(commands.Cog):
         self.internal_app.router.add_get('/api/maintenance/logs/{service}', self.handle_get_logs)
         self.internal_app.router.add_get('/api/maintenance/restart/{service}', self.handle_restart_service)
         self.internal_app.router.add_post('/api/toggle-public', self.handle_toggle_public)
+        self.internal_app.router.add_get('/api/public-status', self.handle_public_status)
 
         # Public server routes (same handlers, auth applied via middleware)
         self.public_app.router.add_options('/{tail:.*}', self.handle_options)
@@ -171,6 +172,7 @@ class ApiCog(commands.Cog):
                 return self.json_response({'error': 'Invalid action, use "start" or "stop"'}, status=400)
         except Exception as e:
             return self.json_response({'error': str(e)}, status=500)
+    
     async def handle_public_status(self, request):
         is_active = hasattr(self, 'public_server') and self.public_server is not None
         return self.json_response({'running': is_active})
