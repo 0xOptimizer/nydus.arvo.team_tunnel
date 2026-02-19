@@ -9,16 +9,9 @@ import asyncio
 import discord
 from datetime import datetime
 from database.db import (
-    get_recent_usage, 
-    get_webhook_project_by_uuid, 
-    get_all_webhook_projects, 
-    create_new_webhook_project, 
-    delete_webhook_project,
-    add_github_project,
-    get_all_github_projects,
-    get_all_attached_projects,
-    remove_github_project,
-    get_user
+    get_recent_usage, get_webhook_project_by_uuid, get_all_webhook_projects, create_new_webhook_project,
+    delete_webhook_project, add_github_project, get_all_github_projects, get_all_attached_projects,
+    remove_github_project, get_user, get_auth_key
 )
 
 def json_serial(obj):
@@ -29,65 +22,159 @@ def json_serial(obj):
 class ApiCog(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
-        self.app = web.Application()
-        self.setup_routes()
-        self.runner = None
-        self.site = None
-        self.port = int(os.getenv('PORT', 4000))
         self.logger = logging.getLogger('nydus')
-        self.start_server.start()
-        self.server_ip = os.getenv('SERVER_IP', '127.0.0.1')
+
+        # Internal server
+        self.internal_app = web.Application()
+        self.internal_port = int(os.getenv('PORT', 4000))
+        self.internal_runner = None
+        self.internal_site = None
+
+        # Public server
+        self.public_app = web.Application(middlewares=[self.public_auth_middleware])
+        self.public_port = int(os.getenv('PUBLIC_PORT', 5013))
+        self.public_runner = None
+        self.public_site = None
+        self.public_enabled = False
+
+        self.setup_routes()
+        self.start_internal_server.start()
 
     def cog_unload(self):
-        self.start_server.cancel()
+        self.start_internal_server.cancel()
+        if self.public_enabled:
+            asyncio.create_task(self.stop_public_server())
 
+    # ------------------------------
+    # ROUTES
+    # ------------------------------
     def setup_routes(self):
-        self.app.router.add_options('/{tail:.*}', self.handle_options)
-        self.app.router.add_post('/api/auth/check-user', self.handle_check_user)
-        self.app.router.add_get('/api/stats', self.handle_get_stats)
+        # Internal server routes
+        self.internal_app.router.add_options('/{tail:.*}', self.handle_options)
+        self.internal_app.router.add_post('/api/auth/check-user', self.handle_check_user)
+        self.internal_app.router.add_get('/api/stats', self.handle_get_stats)
+        self.internal_app.router.add_get('/api/cloudflare/records', self.handle_get_dns_records)
+        self.internal_app.router.add_post('/api/cloudflare/records', self.handle_create_dns_record)
+        self.internal_app.router.add_put('/api/cloudflare/records/{record_id}', self.handle_update_dns_record)
+        self.internal_app.router.add_delete('/api/cloudflare/records/{record_id}', self.handle_delete_dns_record)
+        self.internal_app.router.add_get('/api/cloudflare/analytics', self.handle_get_analytics)
+        self.internal_app.router.add_get('/api/cloudflare/dynamic-analytics', self.handle_get_dynamic_analytics)
+        self.internal_app.router.add_get('/api/github-projects', self.handle_get_github_projects)
+        self.internal_app.router.add_post('/api/github-projects', self.handle_create_github_project)
+        self.internal_app.router.add_delete('/api/github-projects/{uuid}', self.handle_delete_github_project)
+        self.internal_app.router.add_get('/api/attached-projects', self.handle_get_attached_projects)
+        self.internal_app.router.add_post('/webhook/{uuid}', self.handle_webhook)
+        self.internal_app.router.add_get('/api/maintenance/logs/{service}', self.handle_get_logs)
+        self.internal_app.router.add_get('/api/maintenance/restart/{service}', self.handle_restart_service)
+        self.internal_app.router.add_post('/api/toggle-public', self.handle_toggle_public)
 
-        self.app.router.add_get('/api/cloudflare/records', self.handle_get_dns_records)
-        self.app.router.add_post('/api/cloudflare/records', self.handle_create_dns_record)
-        self.app.router.add_put('/api/cloudflare/records/{record_id}', self.handle_update_dns_record)
-        self.app.router.add_delete('/api/cloudflare/records/{record_id}', self.handle_delete_dns_record)
-        self.app.router.add_get('/api/cloudflare/analytics', self.handle_get_analytics)
-        self.app.router.add_get('/api/cloudflare/dynamic-analytics', self.handle_get_dynamic_analytics)
+        # Public server routes (same handlers, auth applied via middleware)
+        self.public_app.router.add_options('/{tail:.*}', self.handle_options)
+        self.public_app.router.add_post('/api/auth/check-user', self.handle_check_user)
+        self.public_app.router.add_get('/api/stats', self.handle_get_stats)
+        self.public_app.router.add_get('/api/cloudflare/records', self.handle_get_dns_records)
+        self.public_app.router.add_post('/api/cloudflare/records', self.handle_create_dns_record)
+        self.public_app.router.add_put('/api/cloudflare/records/{record_id}', self.handle_update_dns_record)
+        self.public_app.router.add_delete('/api/cloudflare/records/{record_id}', self.handle_delete_dns_record)
+        self.public_app.router.add_get('/api/cloudflare/analytics', self.handle_get_analytics)
+        self.public_app.router.add_get('/api/cloudflare/dynamic-analytics', self.handle_get_dynamic_analytics)
+        self.public_app.router.add_get('/api/github-projects', self.handle_get_github_projects)
+        self.public_app.router.add_post('/api/github-projects', self.handle_create_github_project)
+        self.public_app.router.add_delete('/api/github-projects/{uuid}', self.handle_delete_github_project)
+        self.public_app.router.add_get('/api/attached-projects', self.handle_get_attached_projects)
+        self.public_app.router.add_post('/webhook/{uuid}', self.handle_webhook)
+        self.public_app.router.add_get('/api/maintenance/logs/{service}', self.handle_get_logs)
+        self.public_app.router.add_get('/api/maintenance/restart/{service}', self.handle_restart_service)
 
-        # self.app.router.add_get('/api/deployments', self.handle_get_deployments)
-        # self.app.router.add_post('/api/deployments', self.handle_create_deployment)
-        # self.app.router.add_delete('/api/deployments/{uuid}', self.handle_delete_deployment)
-
-        self.app.router.add_get('/api/github-projects', self.handle_get_github_projects)
-        self.app.router.add_post('/api/github-projects', self.handle_create_github_project)
-        self.app.router.add_delete('/api/github-projects/{uuid}', self.handle_delete_github_project)
-
-        self.app.router.add_get('/api/attached-projects', self.handle_get_attached_projects)
-
-        self.app.router.add_post('/webhook/{uuid}', self.handle_webhook)
-
-        self.app.router.add_get('/api/maintenance/logs/{service}', self.handle_get_logs)
-        self.app.router.add_get('/api/maintenance/restart/{service}', self.handle_restart_service)
-
+    # ------------------------------
+    # INTERNAL SERVER
+    # ------------------------------
     @tasks.loop(count=1)
-    async def start_server(self):
-        self.runner = web.AppRunner(self.app)
-        await self.runner.setup()
-        self.site = web.TCPSite(self.runner, '0.0.0.0', self.port)
-        await self.site.start()
+    async def start_internal_server(self):
+        self.internal_runner = web.AppRunner(self.internal_app)
+        await self.internal_runner.setup()
+        self.internal_site = web.TCPSite(self.internal_runner, '0.0.0.0', self.internal_port)
+        await self.internal_site.start()
+        self.logger.info(f"Internal API server started on port {self.internal_port}")
 
-    @start_server.before_loop
-    async def before_start_server(self):
+    @start_internal_server.before_loop
+    async def before_internal_server(self):
         await self.bot.wait_until_ready()
 
-    async def _log_to_discord(self, title, message, color=discord.Color.blue()):
-        output_cog = self.bot.get_cog("OutputCog")
-        if output_cog:
-            await output_cog.send_embed(
-                title=title,
-                description=message,
-                color=color
-            )
+    # ------------------------------
+    # PUBLIC SERVER
+    # ------------------------------
+    async def start_public_server(self):
+        if self.public_enabled:
+            self.logger.warning("Public server already running")
+            return
+        self.public_runner = web.AppRunner(self.public_app)
+        await self.public_runner.setup()
+        self.public_site = web.TCPSite(self.public_runner, '0.0.0.0', self.public_port)
+        await self.public_site.start()
+        self.public_enabled = True
+        self.logger.info(f"Public API server started on port {self.public_port}")
 
+    async def stop_public_server(self):
+        if not self.public_enabled or not self.public_runner:
+            self.logger.warning("Public server not running")
+            return
+        await self.public_runner.cleanup()
+        self.public_runner = None
+        self.public_site = None
+        self.public_enabled = False
+        self.logger.info("Public API server stopped")
+
+    # ------------------------------
+    # MIDDLEWARE
+    # ------------------------------
+    @web.middleware
+    async def public_auth_middleware(self, request, handler):
+        if request.path.startswith("/api/"):
+            auth_key = request.headers.get("X-Auth-Key")
+            success = False
+            try:
+                if not auth_key:
+                    return self.json_response({'error': 'Missing X-Auth-Key'}, status=401)
+
+                result = await validate_auth_key(auth_key)
+                success = result['valid']
+
+                if not success:
+                    return self.json_response({'error': result['reason']}, status=403)
+
+                request['auth_key_data'] = result['data']
+                return await handler(request)
+
+            finally:
+                await execute_query(
+                    "INSERT INTO auth_key_usage (auth_key_secret, endpoint, method, is_success) VALUES (%s, %s, %s, %s)",
+                    (auth_key or "MISSING", request.path, request.method, int(success))
+                )
+        else:
+            return await handler(request)
+
+    # ------------------------------
+    # TOGGLE ENDPOINT
+    # ------------------------------
+    async def handle_toggle_public(self, request):
+        try:
+            data = await request.json()
+            action = data.get('action')
+            if action == 'start':
+                await self.start_public_server()
+                return self.json_response({'status': 'public server started'})
+            elif action == 'stop':
+                await self.stop_public_server()
+                return self.json_response({'status': 'public server stopped'})
+            else:
+                return self.json_response({'error': 'Invalid action, use "start" or "stop"'}, status=400)
+        except Exception as e:
+            return self.json_response({'error': str(e)}, status=500)
+
+    # ------------------------------
+    # COMMON HELPERS
+    # ------------------------------
     def json_response(self, data, status=200):
         return web.json_response(
             data,
@@ -100,13 +187,17 @@ class ApiCog(commands.Cog):
         return web.Response(status=200, headers={
             'Access-Control-Allow-Origin': '*',
             'Access-Control-Allow-Methods': 'GET, POST, DELETE, OPTIONS',
-            'Access-Control-Allow-Headers': 'Content-Type'
+            'Access-Control-Allow-Headers': 'Content-Type, X-Auth-Key'
         })
+
+    async def _log_to_discord(self, title, message, color=discord.Color.blue()):
+        output_cog = self.bot.get_cog("OutputCog")
+        if output_cog:
+            await output_cog.send_embed(title=title, description=message, color=color)
 
     # ------------------------------
     # AUTHENTICATION
     # ------------------------------
-
     async def handle_check_user(self, request):
         try:
             data = await request.json()
@@ -123,7 +214,6 @@ class ApiCog(commands.Cog):
     # ------------------------------
     # STATISTICS
     # ------------------------------
-
     async def handle_get_stats(self, request):
         try:
             stats = await get_recent_usage(limit=1)
@@ -132,15 +222,12 @@ class ApiCog(commands.Cog):
             return self.json_response({'error': str(e)}, status=500)
 
     # ------------------------------
-    # DEPLOYMENTS
+    # DEPLOYMENTS (placeholder)
     # ------------------------------
-
-    
 
     # ------------------------------
     # REPOSITORIES
     # ------------------------------
-
     async def handle_get_github_projects(self, request):
         projects = await get_all_github_projects()
         return self.json_response(projects)
@@ -148,11 +235,9 @@ class ApiCog(commands.Cog):
     async def handle_create_github_project(self, request):
         try:
             data = await request.json()
-            
             owner_id = data.get('owner_discord_id')
             if not owner_id:
                 return self.json_response({'error': 'Missing owner_discord_id'}, status=400)
-
             project_uuid = await add_github_project(
                 name=data.get('name'),
                 owner=data.get('owner'),
@@ -163,25 +248,18 @@ class ApiCog(commands.Cog):
                 ssh_url=data.get('ssh_url'),
                 visibility=data.get('visibility', 'public'),
                 branch=data.get('branch', 'main'),
-                owner_discord_id=owner_id 
+                owner_discord_id=owner_id
             )
             return self.json_response({'uuid': project_uuid}, status=201)
         except Exception as e:
             return self.json_response({'error': str(e)}, status=500)
 
     async def handle_get_attached_projects(self, request):
-        # Extract the ID from the query parameters (?owner_discord_id=...)
         owner_id = request.query.get('owner_discord_id')
-        
         if not owner_id:
             return self.json_response({'error': 'Missing owner_discord_id parameter'}, status=400)
-
         projects = await get_all_attached_projects(owner_id)
-        
-        if projects is None:
-            return self.json_response([])
-            
-        return self.json_response(projects)
+        return self.json_response(projects or [])
 
     async def handle_delete_github_project(self, request):
         uuid = request.match_info['uuid']
@@ -189,15 +267,8 @@ class ApiCog(commands.Cog):
         return self.json_response({'status': 'deleted'})
 
     # ------------------------------
-    # ATTACHED PROJECTS
-    # ------------------------------
-
-    # Note: Handled by handle_get_attached_projects above
-    
-    # ------------------------------
     # MAINTENANCE
     # ------------------------------
-
     async def handle_get_logs(self, request):
         service = request.match_info['service']
         cog = self.bot.get_cog('MaintenanceCog')
@@ -229,7 +300,6 @@ class ApiCog(commands.Cog):
     # ------------------------------
     # WEBHOOKS
     # ------------------------------
-
     async def handle_webhook(self, request):
         uuid = request.match_info['uuid']
         project = await get_webhook_project_by_uuid(uuid)
@@ -253,57 +323,38 @@ class ApiCog(commands.Cog):
     # ------------------------------
     # CLOUDFLARE
     # ------------------------------
-
     async def handle_get_dns_records(self, request):
         cf_cog = self.bot.get_cog('CloudflareCog')
         if not cf_cog:
             return self.json_response({'error': 'Cloudflare module unavailable'}, status=503)
-
         type_filter = request.query.get('type')
         name_filter = request.query.get('name')
-        # Default to page 1 if not provided
         try:
             page = int(request.query.get('page', 1))
         except ValueError:
             page = 1
-
         data, error = await cf_cog.list_dns_records(type=type_filter, name=name_filter, page=page)
-        
         if error:
             return self.json_response({'error': error}, status=400)
-        
         return self.json_response(data)
 
     async def handle_create_dns_record(self, request):
         cf_cog = self.bot.get_cog('CloudflareCog')
         if not cf_cog:
             return self.json_response({'error': 'Cloudflare module unavailable'}, status=503)
-
         try:
             data = await request.json()
-            # Extract fields with defaults matching Cloudflare API
             record_type = data.get('type', 'A')
             name = data.get('name')
             content = data.get('content')
             ttl = int(data.get('ttl', 1))
             proxied = data.get('proxied', True)
             comment = data.get('comment', '')
-
             if not name or not content:
                 return self.json_response({'error': 'Name and Content are required'}, status=400)
-
-            result, error = await cf_cog.create_dns_record(
-                type=record_type,
-                name=name,
-                content=content,
-                ttl=ttl,
-                proxied=proxied,
-                comment=comment
-            )
-
+            result, error = await cf_cog.create_dns_record(type=record_type, name=name, content=content, ttl=ttl, proxied=proxied, comment=comment)
             if error:
                 return self.json_response({'error': error}, status=400)
-            
             return self.json_response(result, status=201)
         except Exception as e:
             return self.json_response({'error': str(e)}, status=500)
@@ -312,9 +363,7 @@ class ApiCog(commands.Cog):
         cf_cog = self.bot.get_cog('CloudflareCog')
         if not cf_cog:
             return self.json_response({'error': 'Cloudflare module unavailable'}, status=503)
-
         record_id = request.match_info['record_id']
-        
         try:
             data = await request.json()
             record_type = data.get('type', 'A')
@@ -323,20 +372,9 @@ class ApiCog(commands.Cog):
             ttl = int(data.get('ttl', 1))
             proxied = data.get('proxied', True)
             comment = data.get('comment', '')
-
-            result, error = await cf_cog.update_dns_record(
-                record_id=record_id,
-                type=record_type,
-                name=name,
-                content=content,
-                ttl=ttl,
-                proxied=proxied,
-                comment=comment
-            )
-
+            result, error = await cf_cog.update_dns_record(record_id=record_id, type=record_type, name=name, content=content, ttl=ttl, proxied=proxied, comment=comment)
             if error:
                 return self.json_response({'error': error}, status=400)
-            
             return self.json_response(result)
         except Exception as e:
             return self.json_response({'error': str(e)}, status=500)
@@ -345,13 +383,10 @@ class ApiCog(commands.Cog):
         cf_cog = self.bot.get_cog('CloudflareCog')
         if not cf_cog:
             return self.json_response({'error': 'Cloudflare module unavailable'}, status=503)
-
         record_id = request.match_info['record_id']
         success, error = await cf_cog.delete_dns_record(record_id)
-
         if error:
             return self.json_response({'error': error}, status=400)
-        
         return self.json_response({'status': 'deleted'})
 
     async def handle_get_analytics(self, request):
@@ -359,13 +394,10 @@ class ApiCog(commands.Cog):
             cf_cog = self.bot.get_cog('CloudflareCog')
             if not cf_cog:
                 return self.json_response({'error': 'Cloudflare module unavailable'}, status=503)
-
             days = int(request.query.get('days', 7))
             stats, error = await cf_cog.get_visitor_stats(days=days)
-            
             if error:
                 return self.json_response({'error': error}, status=400)
-
             return self.json_response(stats)
         except Exception as e:
             return self.json_response({'error': str(e)}, status=500)
@@ -373,32 +405,18 @@ class ApiCog(commands.Cog):
     async def handle_get_dynamic_analytics(self, request):
         try:
             days_raw = request.query.get('days', 7)
-            print(f"[API] Received request for Cloudflare analytics. Parameter days: {days_raw}")
-            
             cf_cog = self.bot.get_cog('CloudflareCog')
             if not cf_cog:
-                print("[API] ERROR: CloudflareCog not found in bot instance")
                 return self.json_response({'error': 'Cloudflare module unavailable'}, status=503)
-
             try:
                 days = int(days_raw)
             except ValueError:
-                print(f"[API] ERROR: Invalid days parameter received: {days_raw}")
                 return self.json_response({'error': 'Invalid days parameter'}, status=400)
-
-            print(f"[API] Calling get_dynamic_analytics for {days} days...")
             stats, error = await cf_cog.get_dynamic_analytics(days=days)
-            
             if error:
-                print(f"[API] CloudflareCog returned error: {error}")
                 return self.json_response({'error': error}, status=400)
-
-            data_count = len(stats.get('data', [])) if stats else 0
-            print(f"[API] Success. Returning {data_count} data points. Granularity: {stats.get('granularity')}")
             return self.json_response(stats)
-            
         except Exception as e:
-            print(f"[API] CRITICAL EXCEPTION in handle_get_dynamic_analytics: {str(e)}")
             import traceback
             traceback.print_exc()
             return self.json_response({'error': str(e)}, status=500)

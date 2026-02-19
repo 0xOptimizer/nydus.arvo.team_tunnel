@@ -2,8 +2,11 @@ import aiomysql
 import os
 import uuid
 import secrets
+import string
 import logging
 from dotenv import load_dotenv
+import hmac
+from datetime import datetime, timezone
 
 load_dotenv()
 
@@ -187,3 +190,75 @@ async def get_user(discord_id):
         (discord_id,),
         fetch_one=True
     )
+
+async def add_auth_key(discord_id, app_name, expires_on=None):
+    alphabet = string.ascii_letters + string.digits
+    random_part = ''.join(secrets.choice(alphabet) for _ in range(58))
+    new_secret = f"nydus_{random_part}"
+
+    query = """INSERT INTO auth_keys 
+               (auth_key_secret, discord_id, app_name, expires_on) 
+               VALUES (%s, %s, %s, %s)"""
+    params = (new_secret, discord_id, app_name, expires_on)
+    result = await execute_query(query, params)
+
+    if result:
+        return {
+            "success": True,
+            "secret": new_secret,
+            "app_name": app_name
+        }
+    return {"success": False}
+
+async def get_auth_key(auth_key_secret):
+    return await execute_query(
+        "SELECT * FROM auth_keys WHERE auth_key_secret = %s AND deleted_at IS NULL",
+        (auth_key_secret,),
+        fetch_one=True
+    )
+
+async def get_user_auth_keys(discord_id):
+    return await execute_query(
+        "SELECT * FROM auth_keys WHERE discord_id = %s AND deleted_at IS NULL",
+        (discord_id,),
+        fetch_all=True
+    )
+
+async def update_auth_key_expiry(auth_key_secret, new_expiry):
+    return await execute_query(
+        "UPDATE auth_keys SET expires_on = %s WHERE auth_key_secret = %s",
+        (new_expiry, auth_key_secret)
+    )
+
+async def soft_remove_auth_key(auth_key_secret):
+    return await execute_query(
+        "UPDATE auth_keys SET deleted_at = CURRENT_TIMESTAMP WHERE auth_key_secret = %s",
+        (auth_key_secret,)
+    )
+
+async def validate_auth_key(auth_key_secret):
+    try:
+        key_data = await execute_query(
+            "SELECT * FROM auth_keys WHERE auth_key_secret = %s AND deleted_at IS NULL",
+            (auth_key_secret,),
+            fetch_one=True
+        )
+
+        if not key_data:
+            return {"valid": False, "reason": "Key not found or deleted", "data": None}
+
+        if not hmac.compare_digest(key_data['auth_key_secret'], auth_key_secret):
+            return {"valid": False, "reason": "Invalid key", "data": None}
+
+        expires_on = key_data.get('expires_on')
+        if expires_on:
+            now_utc = datetime.now(timezone.utc)
+            if expires_on.tzinfo is None:
+                expires_on = expires_on.replace(tzinfo=timezone.utc)
+            if now_utc > expires_on:
+                return {"valid": False, "reason": "Key expired", "data": None}
+
+        return {"valid": True, "reason": None, "data": key_data}
+
+    except Exception:
+        return {"valid": False, "reason": "Internal validation error", "data": None}
