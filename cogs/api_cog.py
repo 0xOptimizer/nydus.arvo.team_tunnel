@@ -11,7 +11,7 @@ from datetime import datetime
 from database.db import (
     get_recent_usage, get_webhook_project_by_uuid, get_all_webhook_projects, create_new_webhook_project,
     delete_webhook_project, add_github_project, get_all_github_projects, get_all_attached_projects,
-    remove_github_project, get_user, get_auth_key, execute_query
+    remove_github_project, get_user, get_auth_key, validate_auth_key, execute_query
 )
 
 def json_serial(obj):
