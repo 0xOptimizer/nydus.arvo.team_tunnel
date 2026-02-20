@@ -262,3 +262,33 @@ async def validate_auth_key(auth_key_secret):
 
     except Exception:
         return {"valid": False, "reason": "Internal validation error", "data": None}
+
+async def log_slash_command(
+    discord_id: str,
+    command_name: str,
+    owner: str,
+    repo: str,
+    used_pat: bool,
+    is_success: bool,
+    error_message: str | None = None
+):
+    """
+    Logs execution of a slash command into slash_command_logs.
+    Never store sensitive values such as raw PAT.
+    """
+    return await execute_query(
+        """
+        INSERT INTO slash_command_logs
+        (discord_id, command_name, owner, repo, used_pat, is_success, error_message)
+        VALUES (%s, %s, %s, %s, %s, %s, %s)
+        """,
+        (
+            str(discord_id),
+            command_name,
+            owner,
+            repo,
+            int(used_pat),
+            int(is_success),
+            error_message
+        )
+    )
