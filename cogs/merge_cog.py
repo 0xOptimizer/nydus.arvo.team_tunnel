@@ -46,7 +46,7 @@ class MergeCog(commands.Cog):
         embed.set_footer(text=f"Auto-merged from {repo_url} ● {footer_time}")
         return embed
 
-    @discord.slash_command(name="merge", description="Auto-merge eligible pull requests in a repository")
+    @discord.slash_command(name="merge", description="Auto-merge eligible pull requests in a repository", guild_ids=[1443171332501278744])
     async def merge(self, ctx: discord.ApplicationContext, owner: str, repo: str, pat: str = None):
         await ctx.defer(ephemeral=True)
         discord_id = str(ctx.user.id)
