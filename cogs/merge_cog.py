@@ -43,10 +43,10 @@ class MergeCog(commands.Cog):
         embed.set_author(name=ctx.user.display_name, icon_url=ctx.user.display_avatar.url)
         embed.set_thumbnail(url="https://i.imgur.com/g6QHFKR.gif")
         footer_time = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
-        embed.set_footer(text=f"Auto-merged from {repo_url} ● {footer_time}")
+        embed.set_footer(text=f"{repo_url} ● {footer_time}")
         return embed
 
-    @discord.slash_command(name="merge", description="Auto-merge eligible pull requests in a repository", guild_ids=[1443171332501278744])
+    @discord.slash_command(name="merge", description="Auto-merge eligible pull requests in a repository", guild_ids=[981071935716876298, 1443171332501278744])
     async def merge(self, ctx: discord.ApplicationContext, owner: str, repo: str, pat: str = None):
         await ctx.defer(ephemeral=True)
         discord_id = str(ctx.user.id)
@@ -120,7 +120,7 @@ class MergeCog(commands.Cog):
                     message = commit["commit"]["message"].split("\n")[0]
                     commit_lines.append(f"- {message}")
 
-            block = f"Pull Request: {pr_title}\nDescription: {pr_body[:500]}\n\nCommits\n{chr(10).join(commit_lines)}\n\nPR URL: {pr_url}"
+            block = f"Pull Request: {pr_title}\nDescription: {pr_body[:500]}\n\nCommits\n{chr(10).join(commit_lines)}\n\n{pr_url}"
             merged_blocks.append(block)
 
         # Build final embed
@@ -128,12 +128,12 @@ class MergeCog(commands.Cog):
             content = "\n\n---\n\n".join(merged_blocks)[:3500]
             embed = self.build_embed(ctx, True, repo_url, "Merged Successfully", content)
             await log_slash_command(discord_id, "merge", owner, repo, used_pat, True, None)
-            await ctx.send(embed=embed)
+            await ctx.followup.send(embed=embed, ephemeral=False)
         else:
             reason_text = "\n".join(failure_reasons) if failure_reasons else "No eligible pull requests."
             embed = self.build_embed(ctx, False, repo_url, "Merge Failed", reason_text)
             await log_slash_command(discord_id, "merge", owner, repo, used_pat, False, reason_text)
-            await ctx.send(embed=embed)
+            await ctx.followup.send(embed=embed, ephemeral=False)
 
 def setup(bot: commands.Bot):
     bot.add_cog(MergeCog(bot))

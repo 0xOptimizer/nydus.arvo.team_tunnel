@@ -35,9 +35,6 @@ cogs_list = [
 @bot.event
 async def on_ready():
     logging.info(f'Nydus Tunnel active as {bot.user}')
-    # TODO: This is unadvisable as per Discord's ToS for bot policies
-    for guild in bot.guilds:
-        await bot.tree.sync(guild=guild)
 
 async def main():
     await init_db()
