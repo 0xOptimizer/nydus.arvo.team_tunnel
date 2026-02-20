@@ -38,7 +38,7 @@ class MergeCog(commands.Cog):
             return 503, {"message": str(e)}
 
     def build_embed(self, ctx: discord.ApplicationContext, success: bool, repo_url: str, title_text: str, body_text: str) -> discord.Embed:
-        color = discord.Color.from_str("#0f9") if success else discord.Color.from_str("#ff4d6d")
+        color = discord.Color("#00ff99") if success else discord.Color("#ff4d6d")
         embed = discord.Embed(title=title_text[:256], description=body_text[:3500], color=color, timestamp=datetime.now(timezone.utc))
         embed.set_author(name=ctx.user.display_name, icon_url=ctx.user.display_avatar.url)
         embed.set_thumbnail(url="https://i.imgur.com/g6QHFKR.gif")
