@@ -128,12 +128,12 @@ class MergeCog(commands.Cog):
             content = "\n\n---\n\n".join(merged_blocks)[:3500]
             embed = self.build_embed(ctx, True, repo_url, "Merged Successfully", content)
             await log_slash_command(discord_id, "merge", owner, repo, used_pat, True, None)
-            await ctx.send(embed=embed)
+            await ctx.followup.send(embed=embed, ephemeral=False)
         else:
             reason_text = "\n".join(failure_reasons) if failure_reasons else "No eligible pull requests."
             embed = self.build_embed(ctx, False, repo_url, "Merge Failed", reason_text)
             await log_slash_command(discord_id, "merge", owner, repo, used_pat, False, reason_text)
-            await ctx.send(embed=embed)
+            await ctx.followup.send(embed=embed, ephemeral=False)
 
 def setup(bot: commands.Bot):
     bot.add_cog(MergeCog(bot))
