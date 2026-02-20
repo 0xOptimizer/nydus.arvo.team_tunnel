@@ -13,7 +13,7 @@ Nydus Tunnel is a Discord bot designed to monitor system resources, manage deplo
 ## Setup
 
 ### Prerequisites
-- Python 3.9+
+- Python 3.11+
 - Git (optional, for version control)
 - A Discord bot token
 
