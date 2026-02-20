@@ -28,7 +28,8 @@ cogs_list = [
     'cogs.users_cog',
     'cogs.maintenance_cog',
     'cogs.cloudflare_cog',
-    'cogs.generate_auth_cog'
+    'cogs.generate_auth_cog',
+    'cogs.merge_cog'
 ]
 
 @bot.event
