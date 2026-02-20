@@ -41,7 +41,7 @@ class MergeCog(commands.Cog):
         color = discord.Color(0x00ff99) if success else discord.Color(0xff4d6d)
         embed = discord.Embed(title=title_text[:256], description=body_text[:3500], color=color, timestamp=datetime.now(timezone.utc))
         embed.set_author(name=ctx.user.display_name, icon_url=ctx.user.display_avatar.url)
-        embed.set_thumbnail(url="https://i.imgur.com/g6QHFKR.gif")
+        embed.set_thumbnail(url="https://i.imgur.com/sFyuizN.gif")
         footer_time = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
         embed.set_footer(text=f"{repo_url} ● {footer_time}")
         return embed
@@ -123,17 +123,19 @@ class MergeCog(commands.Cog):
             block = f"Pull Request: {pr_title}\nDescription: {pr_body[:500]}\n\nCommits\n{chr(10).join(commit_lines)}\n\n{pr_url}"
             merged_blocks.append(block)
 
+        await ctx.followup.send("Processing complete! You may now dismiss this message.", ephemeral=True)
+
         # Build final embed
         if merged_blocks:
             content = "\n\n---\n\n".join(merged_blocks)[:3500]
             embed = self.build_embed(ctx, True, repo_url, "Merged Successfully", content)
             await log_slash_command(discord_id, "merge", owner, repo, used_pat, True, None)
-            await ctx.followup.send(embed=embed, ephemeral=False)
+            await ctx.channel.send(embed=embed)
         else:
             reason_text = "\n".join(failure_reasons) if failure_reasons else "No eligible pull requests."
             embed = self.build_embed(ctx, False, repo_url, "Merge Failed", reason_text)
             await log_slash_command(discord_id, "merge", owner, repo, used_pat, False, reason_text)
-            await ctx.followup.send(embed=embed, ephemeral=False)
+            await ctx.channel.send(embed=embed)
 
 def setup(bot: commands.Bot):
     bot.add_cog(MergeCog(bot))
