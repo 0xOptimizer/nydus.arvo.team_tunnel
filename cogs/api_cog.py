@@ -274,14 +274,65 @@ class ApiCog(commands.Cog):
     # MAINTENANCE
     # ------------------------------
     async def handle_get_logs(self, request):
-        service = request.match_info['service']
-        cog = self.bot.get_cog('MaintenanceCog')
+        service = request.match_info["service"]
+
+        cog = self.bot.get_cog("MaintenanceCog")
         if not cog:
-            return self.json_response({'error': 'Maintenance module unavailable'}, status=503)
-        success, output = await cog.get_service_logs(service)
-        if not success:
-            return self.json_response({'error': output}, status=400)
-        return self.json_response({'logs': output})
+            return web.json_response(
+                {"error": "Maintenance module unavailable"},
+                status=503
+            )
+
+        # Select command
+        if service == "nginx":
+            cmd = "tail -n 50 -F /var/log/nginx/error.log"
+        elif service == "arvo-team":
+            cmd = "pm2 logs arvo.team --lines 50 --time"
+        elif service == "nydus-ui":
+            cmd = "pm2 logs nydus-ui --lines 50 --time"
+        elif service == "nydus":
+            cmd = "journalctl -u nydus -n 50 -f -o short-iso"
+        else:
+            return web.json_response(
+                {"error": "Unknown service"},
+                status=400
+            )
+
+        response = web.StreamResponse(
+            status=200,
+            headers={
+                "Content-Type": "text/event-stream",
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+            },
+        )
+
+        await response.prepare(request)
+
+        process = await asyncio.create_subprocess_shell(
+            cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+        )
+
+        try:
+            while not process.stdout.at_eof():
+                line = await process.stdout.readline()
+                if not line:
+                    await asyncio.sleep(0.05)
+                    continue
+
+                payload = line.decode().rstrip()
+                data = f"data: {payload}\n\n"
+                await response.write(data.encode())
+        except (asyncio.CancelledError, ConnectionResetError):
+            pass
+        finally:
+            if process.returncode is None:
+                process.kill()
+                await process.wait()
+
+        return response
 
     async def handle_restart_service(self, request):
         service = request.match_info['service']
