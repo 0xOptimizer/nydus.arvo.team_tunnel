@@ -283,15 +283,14 @@ class ApiCog(commands.Cog):
                 status=503
             )
 
-        # Select command
-        if service == "nginx":
-            cmd = "tail -n 50 -F /var/log/nginx/error.log"
-        elif service == "arvo-team":
-            cmd = "pm2 logs arvo.team --lines 50 --time"
-        elif service == "nydus-ui":
-            cmd = "pm2 logs nydus-ui --lines 50 --time"
-        elif service == "nydus":
-            cmd = "journalctl -u nydus -n 50 -f -o short-iso"
+        if service == "arvo-team":
+            cmd = "pm2 logs arvo.team --lines 50 --time --raw"
+        # elif service == "nginx":
+        #     cmd = "tail -n 50 -F /var/log/nginx/error.log"
+        # elif service == "nydus-ui":
+        #     cmd = "pm2 logs nydus-ui --lines 50 --time --raw"
+        # elif service == "nydus":
+        #     cmd = "journalctl -u nydus -n 50 -f -o short-iso"
         else:
             return web.json_response(
                 {"error": "Unknown service"},
@@ -322,9 +321,10 @@ class ApiCog(commands.Cog):
                     await asyncio.sleep(0.05)
                     continue
 
-                payload = line.decode().rstrip()
+                payload = line.decode(errors="ignore").replace("\r", "").rstrip("\n")
                 data = f"data: {payload}\n\n"
                 await response.write(data.encode())
+                await response.drain()
         except (asyncio.CancelledError, ConnectionResetError):
             pass
         finally:
