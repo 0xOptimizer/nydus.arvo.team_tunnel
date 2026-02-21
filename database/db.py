@@ -89,11 +89,13 @@ async def get_recent_averages():
 
 async def get_recent_system_resources_with_averages():
     query = """
-        SELECT *, 
-               (SELECT AVG(cpu) FROM system_stats WHERE timestamp >= NOW() - INTERVAL 3 MINUTE) as avg_cpu,
-               (SELECT AVG(ram_percent) FROM system_stats WHERE timestamp >= NOW() - INTERVAL 3 MINUTE) as avg_ram 
-        FROM system_stats 
-        ORDER BY timestamp DESC 
+        SELECT main.*, 
+               (SELECT AVG(cpu) FROM system_stats AS sub_cpu 
+                WHERE sub_cpu.timestamp >= NOW() - INTERVAL 3 MINUTE) AS avg_cpu,
+               (SELECT AVG(ram_percent) FROM system_stats AS sub_ram 
+                WHERE sub_ram.timestamp >= NOW() - INTERVAL 3 MINUTE) AS avg_ram 
+        FROM system_stats AS main
+        ORDER BY main.timestamp DESC 
         LIMIT 1
     """
     return await execute_query(query, fetch_all=False)
