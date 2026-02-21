@@ -85,7 +85,7 @@ async def get_system_resources(limit=10):
 
 async def get_recent_averages():
     query = "SELECT AVG(cpu), AVG(ram_percent) FROM system_stats WHERE timestamp >= NOW() - INTERVAL 3 MINUTE"
-    return await execute_query(query, fetch_all=False)
+    return await execute_query(query, fetch_one=True)
 
 async def get_recent_system_resources_with_averages():
     query = """
@@ -98,7 +98,7 @@ async def get_recent_system_resources_with_averages():
         ORDER BY main.timestamp DESC 
         LIMIT 1
     """
-    return await execute_query(query, fetch_all=False)
+    return await execute_query(query, fetch_one=True)
 
 async def log_deployment(project, status, trigger, output):
     await execute_query(
