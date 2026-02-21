@@ -1,8 +1,9 @@
 import discord
 from discord.ext import commands, tasks
 import psutil
+import os
 import logging
-from database.db import log_usage, execute_query
+from database.db import log_system_resources, execute_query
 
 class MonitoringCog(commands.Cog):
     def __init__(self, bot):
@@ -18,11 +19,34 @@ class MonitoringCog(commands.Cog):
     async def monitor_system(self):
         try:
             cpu = psutil.cpu_percent(interval=None)
-            ram = psutil.virtual_memory().percent
-            disk = psutil.disk_usage('/').percent
+            
+            mem = psutil.virtual_memory()
+            ram_percent = mem.percent
+            ram_remaining = mem.available
+            ram_total = mem.total
+
+            disk_info = psutil.disk_usage('/')
+            disk_percent = disk_info.percent
+            disk_remaining = disk_info.free
+
+            st = os.statvfs('/')
+            inodes_total = st.f_files
+            inodes_free = st.f_ffree
+            inodes_used = inodes_total - inodes_free
+
             connections = len(psutil.net_connections())
 
-            await log_usage(cpu, ram, disk, connections)
+            await log_system_resources(
+                cpu, 
+                ram_percent, 
+                ram_remaining, 
+                ram_total, 
+                disk_percent, 
+                disk_remaining, 
+                inodes_used, 
+                inodes_total, 
+                connections
+            )
         except Exception as e:
             logging.error(f"Monitoring error: {e}")
 
@@ -30,9 +54,9 @@ class MonitoringCog(commands.Cog):
     async def cleanup_old_logs(self):
         try:
             await execute_query(
-                "DELETE FROM usage_logs WHERE timestamp < NOW() - INTERVAL 7 DAY"
+                "DELETE FROM system_stats WHERE timestamp < datetime('now', '-7 days')"
             )
-            logging.info("Cleaned up old usage logs.")
+            logging.info("Cleaned up old system resources logs.")
         except Exception as e:
             logging.error(f"Cleanup error: {e}")
 
