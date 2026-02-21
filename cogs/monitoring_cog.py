@@ -28,6 +28,7 @@ class MonitoringCog(commands.Cog):
             disk_info = psutil.disk_usage('/')
             disk_percent = disk_info.percent
             disk_remaining = disk_info.free
+            disk_total = disk_info.total
 
             st = os.statvfs('/')
             inodes_total = st.f_files
@@ -43,6 +44,7 @@ class MonitoringCog(commands.Cog):
                 ram_total, 
                 disk_percent, 
                 disk_remaining, 
+                disk_total,
                 inodes_used, 
                 inodes_total, 
                 connections

@@ -68,13 +68,13 @@ async def execute_query(query, params=(), fetch_one=False, fetch_all=False):
         logger.error(f"Unexpected Error: {e}")
         return None
 
-async def log_system_resources(cpu, ram_p, ram_rem, ram_tot, disk_p, disk_rem, i_used, i_tot, conn):
+async def log_system_resources(cpu, ram_p, ram_rem, ram_tot, disk_p, disk_rem, disk_total, i_used, i_tot, conn):
     query = """
         INSERT INTO system_stats 
-        (cpu, ram_percent, ram_remaining, ram_total, disk_percent, disk_remaining, inodes_used, inodes_total, connections) 
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+        (cpu, ram_percent, ram_remaining, ram_total, disk_percent, disk_remaining, disk_total, inodes_used, inodes_total, connections) 
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
     """
-    await execute_query(query, (cpu, ram_p, ram_rem, ram_tot, disk_p, disk_rem, i_used, i_tot, conn))
+    await execute_query(query, (cpu, ram_p, ram_rem, ram_tot, disk_p, disk_rem, disk_total, i_used, i_tot, conn))
 
 async def get_system_resources(limit=10):
     return await execute_query(
