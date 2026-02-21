@@ -9,7 +9,7 @@ import asyncio
 import discord
 from datetime import datetime
 from database.db import (
-    get_recent_usage, get_webhook_project_by_uuid, get_all_webhook_projects, create_new_webhook_project,
+    get_recent_system_resources_with_averages, get_webhook_project_by_uuid, get_all_webhook_projects, create_new_webhook_project,
     delete_webhook_project, add_github_project, get_all_github_projects, get_all_attached_projects,
     remove_github_project, get_user, get_auth_key, validate_auth_key, execute_query
 )
@@ -52,7 +52,7 @@ class ApiCog(commands.Cog):
         # Internal server routes
         self.internal_app.router.add_options('/{tail:.*}', self.handle_options)
         self.internal_app.router.add_post('/api/auth/check-user', self.handle_check_user)
-        self.internal_app.router.add_get('/api/stats', self.handle_get_stats)
+        self.internal_app.router.add_get('/api/stats', self.handle_get_system_resources)
         self.internal_app.router.add_get('/api/cloudflare/records', self.handle_get_dns_records)
         self.internal_app.router.add_post('/api/cloudflare/records', self.handle_create_dns_record)
         self.internal_app.router.add_put('/api/cloudflare/records/{record_id}', self.handle_update_dns_record)
@@ -72,7 +72,7 @@ class ApiCog(commands.Cog):
         # Public server routes (same handlers, auth applied via middleware)
         self.public_app.router.add_options('/{tail:.*}', self.handle_options)
         self.public_app.router.add_post('/api/auth/check-user', self.handle_check_user)
-        self.public_app.router.add_get('/api/stats', self.handle_get_stats)
+        self.public_app.router.add_get('/api/stats', self.handle_get_system_resources)
         self.public_app.router.add_get('/api/cloudflare/records', self.handle_get_dns_records)
         self.public_app.router.add_post('/api/cloudflare/records', self.handle_create_dns_record)
         self.public_app.router.add_put('/api/cloudflare/records/{record_id}', self.handle_update_dns_record)
@@ -218,9 +218,12 @@ class ApiCog(commands.Cog):
     # ------------------------------
     # STATISTICS
     # ------------------------------
-    async def handle_get_stats(self, request):
+    async def handle_get_system_resources(self, request):
         try:
-            stats = await get_recent_usage(limit=1)
+            stats = await get_recent_system_resources_with_averages()
+            if not stats:
+                return self.json_response({'error': 'No data available'}, status=404)
+                
             return self.json_response(stats)
         except Exception as e:
             return self.json_response({'error': str(e)}, status=500)

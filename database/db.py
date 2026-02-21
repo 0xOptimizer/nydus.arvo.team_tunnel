@@ -68,23 +68,40 @@ async def execute_query(query, params=(), fetch_one=False, fetch_all=False):
         logger.error(f"Unexpected Error: {e}")
         return None
 
-async def log_usage(cpu, ram, disk, connections):
-    await execute_query(
-        "INSERT INTO usage_logs (cpu_percent, ram_percent, disk_percent, active_connections) VALUES (%s, %s, %s, %s)",
-        (cpu, ram, disk, connections)
+async def log_system_resources(cpu, ram_p, ram_rem, ram_tot, disk_p, disk_rem, i_used, i_tot, conn):
+    query = """
+        INSERT INTO system_stats 
+        (cpu, ram_percent, ram_remaining, ram_total, disk_percent, disk_remaining, inodes_used, inodes_total, connections) 
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+    """
+    await execute_query(query, (cpu, ram_p, ram_rem, ram_tot, disk_p, disk_rem, i_used, i_tot, conn))
+
+async def get_system_resources(limit=10):
+    return await execute_query(
+        "SELECT * FROM system_stats ORDER BY timestamp DESC LIMIT %s",
+        (limit,),
+        fetch_all=True
     )
+
+async def get_recent_averages():
+    query = "SELECT AVG(cpu), AVG(ram_percent) FROM system_stats WHERE timestamp >= NOW() - INTERVAL 3 MINUTE"
+    return await execute_query(query, fetch_all=False)
+
+async def get_recent_system_resources_with_averages():
+    query = """
+        SELECT *, 
+               (SELECT AVG(cpu) FROM system_stats WHERE timestamp >= NOW() - INTERVAL 3 MINUTE) as avg_cpu,
+               (SELECT AVG(ram_percent) FROM system_stats WHERE timestamp >= NOW() - INTERVAL 3 MINUTE) as avg_ram 
+        FROM system_stats 
+        ORDER BY timestamp DESC 
+        LIMIT 1
+    """
+    return await execute_query(query, fetch_all=False)
 
 async def log_deployment(project, status, trigger, output):
     await execute_query(
         "INSERT INTO deployment_history (project_name, status, triggered_by, output_log) VALUES (%s, %s, %s, %s)",
         (project, status, trigger, output)
-    )
-
-async def get_recent_usage(limit=10):
-    return await execute_query(
-        "SELECT * FROM usage_logs ORDER BY timestamp DESC LIMIT %s", 
-        (limit,), 
-        fetch_all=True
     )
 
 async def get_deployments(limit=5):
