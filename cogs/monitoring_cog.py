@@ -54,7 +54,7 @@ class MonitoringCog(commands.Cog):
     async def cleanup_old_logs(self):
         try:
             await execute_query(
-                "DELETE FROM system_stats WHERE timestamp < datetime('now', '-7 days')"
+                "DELETE FROM system_stats WHERE timestamp < NOW() - INTERVAL 30 DAY"
             )
             logging.info("Cleaned up old system resources logs.")
         except Exception as e:
