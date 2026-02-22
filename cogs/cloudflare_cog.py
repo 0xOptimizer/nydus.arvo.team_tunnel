@@ -184,31 +184,31 @@ class CloudflareCog(commands.Cog):
         start_time_str = start_time.strftime('%Y-%m-%dT%H:%M:%SZ')
 
         query = """
-            query GetDynamicStats($zoneTag: String!, $startTime: DateTime!) {
-            viewer {
-                zones(filter: { zoneTag: $zoneTag }) {
-                httpRequestsAdaptiveGroups(
-                    limit: 1000,
-                    filter: { datetime_geq: $startTime },
-                    orderBy: [datetime_ASC]
-                ) {
-                    dimensions {
-                    datetime
-                    clientCountryName
-                    userAgentOS
-                    userAgentBrowser
-                    deviceType
-                    }
-                    sum {
-                    requests
-                    edgeResponseBytes
-                    visits
-                    }
+        query GetDynamicStats($zoneTag: String!, $startTime: DateTime!) {
+        viewer {
+            zones(filter: { zoneTag: $zoneTag }) {
+            httpRequestsAdaptiveGroups(
+                limit: 1000,
+                filter: { datetime_geq: $startTime },
+                orderBy: [datetime_ASC]
+            ) {
+                dimensions {
+                datetime
+                clientCountryName
+                userAgentOS
+                userAgentBrowser
+                clientDeviceType
                 }
+                sum {
+                requests
+                edgeResponseBytes
+                visits
                 }
             }
             }
-            """
+        }
+        }
+        """
         
         variables = {
             "zoneTag": self.zone_id,
@@ -230,23 +230,23 @@ class CloudflareCog(commands.Cog):
             for item in raw_stats:
                 dims = item.get('dimensions', {})
                 sums = item.get('sum', {})
-                visits = sums.get('visits', 0)
+                v = sums.get('visits', 0)
                 
                 point = {
                     "timestamp": dims.get('datetime'),
-                    "visitors": visits,
+                    "visitors": v,
                     "bandwidth_gb": round(sums.get('edgeResponseBytes', 0) / (1024**3), 4),
                     "requests": sums.get('requests', 0),
-                    "countries": {dims.get('clientCountryName', 'Unknown'): visits},
-                    "devices": {dims.get('deviceType', 'Unknown'): visits},
-                    "browsers": {dims.get('userAgentBrowser', 'Unknown'): visits},
-                    "os": {dims.get('userAgentOS', 'Unknown'): visits}
+                    "countries": {dims.get('clientCountryName', 'Unknown'): v},
+                    "devices": {dims.get('clientDeviceType', 'Unknown'): v},
+                    "browsers": {dims.get('userAgentBrowser', 'Unknown'): v},
+                    "os": {dims.get('userAgentOS', 'Unknown'): v}
                 }
                 history.append(point)
 
             return {"data": history, "granularity": "hourly" if days <= 3 else "daily"}, None
-        except (KeyError, IndexError) as e:
-            return None, f"Data parsing error: {str(e)}"
+        except Exception as e:
+            return None, f"Parsing error: {str(e)}"
 
 def setup(bot):
     bot.add_cog(CloudflareCog(bot))
