@@ -178,33 +178,87 @@ class CloudflareCog(commands.Cog):
 
     async def get_dynamic_analytics(self, days: int = 7) -> Tuple[Optional[Dict], Optional[str]]:
         if days > 7:
-            days = 7  # Free plan limit
+            days = 7
 
         end_time = datetime.now(timezone.utc)
-        tasks = []
-        
-        # Create one task per day (24-hour window)
+        all_points = []
+
         for day_offset in range(days):
             day_end = end_time - timedelta(days=day_offset)
             day_start = day_end - timedelta(days=1)
-            tasks.append(self._query_day(day_start, day_end))
-        
-        # Run all queries concurrently (optional – removes sequentially)
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-        
-        all_points = []
-        for i, result in enumerate(results):
-            if isinstance(result, Exception):
-                # Log error for day i, but continue with other days
-                print(f"Error on day {i}: {result}")
+            points, error = await self._query_day(day_start, day_end)
+            if error:
+                # Log error if needed, but continue to avoid data gaps
                 continue
-            if result:  # result is list of points
-                all_points.extend(result)
-        
-        # Sort chronologically (oldest first)
+            all_points.extend(points)
+
+        if not all_points:
+            return {"data": [], "granularity": "daily"}, None
+
         all_points.sort(key=lambda x: x["timestamp"])
-        
-        return {"data": all_points, "granularity": "daily"}, None
+
+        if days <= 1:
+            bucket_seconds = 3600 # 1 hour
+        elif days <= 3:
+            bucket_seconds = 4 * 3600 # 4 hours
+        else:
+            bucket_seconds = 24 * 3600 # 1 day
+
+        from collections import defaultdict
+        buckets = defaultdict(lambda: {
+            "visitors": 0,
+            "bandwidth_gb": 0.0,
+            "requests": 0,
+            "countries": defaultdict(int),
+            "devices": defaultdict(int),
+            "browsers": defaultdict(int),
+            "os": defaultdict(int)
+        })
+
+        for point in all_points:
+            ts = datetime.fromisoformat(point["timestamp"].replace('Z', '+00:00'))
+            if bucket_seconds < 86400:
+                bucket_hours = bucket_seconds // 3600
+                bucket_ts = ts.replace(
+                    minute=0, second=0, microsecond=0,
+                    hour=(ts.hour // bucket_hours) * bucket_hours
+                )
+            else:
+                bucket_ts = ts.replace(hour=0, minute=0, second=0, microsecond=0)
+
+            bucket_key = bucket_ts.isoformat().replace('+00:00', 'Z')
+
+            b = buckets[bucket_key]
+            b["visitors"] += point["visitors"]
+            b["bandwidth_gb"] += point["bandwidth_gb"]
+            b["requests"] += point["requests"]
+
+            for dim in ["countries", "devices", "browsers", "os"]:
+                for key, val in point.get(dim, {}).items():
+                    b[dim][key] += val
+
+        aggregated = []
+        for ts in sorted(buckets.keys()):
+            b = buckets[ts]
+            aggregated.append({
+                "timestamp": ts,
+                "visitors": b["visitors"],
+                "bandwidth_gb": round(b["bandwidth_gb"], 4),
+                "requests": b["requests"],
+                "countries": dict(b["countries"]),
+                "devices": dict(b["devices"]),
+                "browsers": dict(b["browsers"]),
+                "os": dict(b["os"])
+            })
+
+        if days <= 1:
+            granularity = "hourly"
+        elif days <= 3:
+            granularity = "4hourly"
+        else:
+            granularity = "daily"
+
+        return {"data": aggregated, "granularity": granularity}, None
 
     async def _query_day(self, start: datetime, end: datetime) -> List[Dict]:
         """Query httpRequestsAdaptiveGroups for a single 24‑hour window."""
