@@ -180,60 +180,39 @@ class CloudflareCog(commands.Cog):
         if days > 30:
             days = 30
         
-        is_hourly = days <= 3
-        dataset = "httpRequests1hGroups" if is_hourly else "httpRequests1dGroups"
-        
-        dimension = "datetime" if is_hourly else "date"
-        order_by = "datetime_ASC" if is_hourly else "date_ASC"
-        
-        now_utc = datetime.now(timezone.utc)
-        end_time = now_utc.replace(minute=0, second=0, microsecond=0)
-        
-        if is_hourly:
-            end_time = end_time - timedelta(hours=1)
-            
-        start_time = end_time - timedelta(days=days)
+        start_time = datetime.now(timezone.utc) - timedelta(days=days)
+        start_time_str = start_time.strftime('%Y-%m-%dT%H:%M:%SZ')
 
-        query_template = """
-        query GetDynamicStats($zoneTag: String!, $startTime: DateTime!, $endTime: DateTime!) {{
-        viewer {{
-            zones(filter: {{ zoneTag: $zoneTag }}) {{
-            {dataset}(
-                limit: 500,
-                filter: {{ 
-                    {date_filter}: $startTime, 
-                    {date_filter_end}: $endTime 
-                }},
-                orderBy: [{order_by}]
-            ) {{
-                dimensions {{
-                {dimension}
-                }}
-                uniq {{
-                uniques
-                }}
-                sum {{
+        query = """
+        query GetDynamicStats($zoneTag: String!, $startTime: DateTime!) {
+        viewer {
+            zones(filter: { zoneTag: $zoneTag }) {
+            httpRequestsAdaptiveGroups(
+                limit: 1000,
+                filter: { datetime_geq: $startTime },
+                orderBy: [datetime_ASC]
+            ) {
+                dimensions {
+                datetime
+                clientCountryName
+                userAgentOS
+                clientBrowserUpper
+                deviceType
+                }
+                sum {
                 requests
-                bytes
-                }}
-            }}
-            }}
-        }}
-        }}
+                edgeResponseBytes
+                visits
+                }
+            }
+            }
+        }
+        }
         """
         
-        query = query_template.format(
-            dataset=dataset,
-            dimension=dimension,
-            order_by=order_by,
-            date_filter="datetime_geq" if is_hourly else "date_geq",
-            date_filter_end="datetime_leq" if is_hourly else "date_leq"
-        )
-
         variables = {
             "zoneTag": self.zone_id,
-            "startTime": start_time.strftime('%Y-%m-%dT%H:%M:%SZ') if is_hourly else start_time.date().isoformat(),
-            "endTime": end_time.strftime('%Y-%m-%dT%H:%M:%SZ') if is_hourly else end_time.date().isoformat()
+            "startTime": start_time_str
         }
 
         data, error = await self._make_graphql_request(query, variables)
@@ -242,34 +221,29 @@ class CloudflareCog(commands.Cog):
 
         try:
             zones = data.get('viewer', {}).get('zones', [])
-            if not zones or not zones[0].get(dataset):
-                return {"data": [], "granularity": "hourly" if is_hourly else "daily"}, None
+            if not zones:
+                return {"data": [], "granularity": "adaptive"}, None
 
-            raw_stats = zones[0].get(dataset, [])
+            raw_stats = zones[0].get('httpRequestsAdaptiveGroups', [])
             history = []
 
             for item in raw_stats:
-                sum_data = item.get('sum', {})
-                raw_ts = item['dimensions'][dimension]
+                dims = item.get('dimensions', {})
+                sums = item.get('sum', {})
                 
-                if not is_hourly:
-                    ts_value = f"{raw_ts}T00:00:00Z"
-                else:
-                    ts_value = raw_ts
-
                 point = {
-                    "timestamp": ts_value,
-                    "visitors": item['uniq'].get('uniques', 0),
-                    "bandwidth_gb": round(sum_data.get('bytes', 0) / (1024**3), 4),
-                    "requests": sum_data.get('requests', 0),
-                    "countries": {},
-                    "devices": {},
-                    "browsers": {},
-                    "os": {}
+                    "timestamp": f"{dims.get('datetime')}Z",
+                    "visitors": sums.get('visits', 0),
+                    "bandwidth_gb": round(sums.get('edgeResponseBytes', 0) / (1024**3), 4),
+                    "requests": sums.get('requests', 0),
+                    "countries": {dims.get('clientCountryName', 'Unknown'): sums.get('visits', 0)},
+                    "devices": {dims.get('deviceType', 'Unknown'): sums.get('visits', 0)},
+                    "browsers": {dims.get('clientBrowserUpper', 'Unknown'): sums.get('visits', 0)},
+                    "os": {dims.get('userAgentOS', 'Unknown'): sums.get('visits', 0)}
                 }
                 history.append(point)
 
-            return {"data": history, "granularity": "hourly" if is_hourly else "daily"}, None
+            return {"data": history, "granularity": "hourly" if days <= 3 else "daily"}, None
         except (KeyError, IndexError) as e:
             return None, f"Data parsing error: {str(e)}"
 
