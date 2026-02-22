@@ -184,31 +184,31 @@ class CloudflareCog(commands.Cog):
         start_time_str = start_time.strftime('%Y-%m-%dT%H:%M:%SZ')
 
         query = """
-        query GetDynamicStats($zoneTag: String!, $startTime: DateTime!) {
-        viewer {
-            zones(filter: { zoneTag: $zoneTag }) {
-            httpRequestsAdaptiveGroups(
-                limit: 1000,
-                filter: { datetime_geq: $startTime },
-                orderBy: [datetime_ASC]
-            ) {
-                dimensions {
-                datetime
-                clientCountryName
-                userAgentOS
-                clientBrowserUpper
-                deviceType
+            query GetDynamicStats($zoneTag: String!, $startTime: DateTime!) {
+            viewer {
+                zones(filter: { zoneTag: $zoneTag }) {
+                httpRequestsAdaptiveGroups(
+                    limit: 1000,
+                    filter: { datetime_geq: $startTime },
+                    orderBy: [datetime_ASC]
+                ) {
+                    dimensions {
+                    datetime
+                    clientCountryName
+                    userAgentOS
+                    userAgentBrowser
+                    deviceType
+                    }
+                    sum {
+                    requests
+                    edgeResponseBytes
+                    visits
+                    }
                 }
-                sum {
-                requests
-                edgeResponseBytes
-                visits
                 }
             }
             }
-        }
-        }
-        """
+            """
         
         variables = {
             "zoneTag": self.zone_id,
@@ -230,16 +230,17 @@ class CloudflareCog(commands.Cog):
             for item in raw_stats:
                 dims = item.get('dimensions', {})
                 sums = item.get('sum', {})
+                visits = sums.get('visits', 0)
                 
                 point = {
-                    "timestamp": f"{dims.get('datetime')}Z",
-                    "visitors": sums.get('visits', 0),
+                    "timestamp": dims.get('datetime'),
+                    "visitors": visits,
                     "bandwidth_gb": round(sums.get('edgeResponseBytes', 0) / (1024**3), 4),
                     "requests": sums.get('requests', 0),
-                    "countries": {dims.get('clientCountryName', 'Unknown'): sums.get('visits', 0)},
-                    "devices": {dims.get('deviceType', 'Unknown'): sums.get('visits', 0)},
-                    "browsers": {dims.get('clientBrowserUpper', 'Unknown'): sums.get('visits', 0)},
-                    "os": {dims.get('userAgentOS', 'Unknown'): sums.get('visits', 0)}
+                    "countries": {dims.get('clientCountryName', 'Unknown'): visits},
+                    "devices": {dims.get('deviceType', 'Unknown'): visits},
+                    "browsers": {dims.get('userAgentBrowser', 'Unknown'): visits},
+                    "os": {dims.get('userAgentOS', 'Unknown'): visits}
                 }
                 history.append(point)
 
