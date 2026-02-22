@@ -2,7 +2,7 @@ import aiohttp
 import os
 import logging
 import asyncio
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Optional, List, Dict, Any, Tuple
 from discord.ext import commands
 
@@ -186,7 +186,12 @@ class CloudflareCog(commands.Cog):
         dimension = "datetime" if is_hourly else "date"
         order_by = "datetime_ASC" if is_hourly else "date_ASC"
         
-        end_time = datetime.utcnow().replace(minute=0, second=0, microsecond=0)
+        now_utc = datetime.now(timezone.utc)
+        end_time = now_utc.replace(minute=0, second=0, microsecond=0)
+        
+        if is_hourly:
+            end_time = end_time - timedelta(hours=1)
+            
         start_time = end_time - timedelta(days=days)
 
         query_template = """
@@ -237,16 +242,23 @@ class CloudflareCog(commands.Cog):
 
         try:
             zones = data.get('viewer', {}).get('zones', [])
-            if not zones:
-                return {"data": [], "granularity": "daily"}, None
+            if not zones or not zones[0].get(dataset):
+                return {"data": [], "granularity": "hourly" if is_hourly else "daily"}, None
 
             raw_stats = zones[0].get(dataset, [])
             history = []
 
             for item in raw_stats:
                 sum_data = item.get('sum', {})
+                raw_ts = item['dimensions'][dimension]
+                
+                if not is_hourly:
+                    ts_value = f"{raw_ts}T00:00:00Z"
+                else:
+                    ts_value = raw_ts
+
                 point = {
-                    "timestamp": item['dimensions'][dimension],
+                    "timestamp": ts_value,
                     "visitors": item['uniq'].get('uniques', 0),
                     "bandwidth_gb": round(sum_data.get('bytes', 0) / (1024**3), 4),
                     "requests": sum_data.get('requests', 0),
