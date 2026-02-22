@@ -5,6 +5,7 @@ import asyncio
 from datetime import datetime, timedelta, timezone
 from typing import Optional, List, Dict, Any, Tuple
 from discord.ext import commands
+from collections import defaultdict
 
 class CloudflareCog(commands.Cog):
     def __init__(self, bot):
@@ -177,34 +178,50 @@ class CloudflareCog(commands.Cog):
         return True, None
 
     async def get_dynamic_analytics(self, days: int = 7) -> Tuple[Optional[Dict], Optional[str]]:
+        """
+        Fetch analytics for the given number of days (1, 3, or 7).
+        Returns a tuple (data_dict, error) where data_dict contains:
+            - "data": list of aggregated points
+            - "granularity": "hourly", "4hourly", or "daily"
+        """
         if days > 7:
             days = 7
 
         end_time = datetime.now(timezone.utc)
-        all_points = []
+        tasks = []
 
         for day_offset in range(days):
             day_end = end_time - timedelta(days=day_offset)
             day_start = day_end - timedelta(days=1)
-            points, error = await self._query_day(day_start, day_end)
+            tasks.append(self._query_day(day_start, day_end))
+
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        all_points = []
+        for i, result in enumerate(results):
+            if isinstance(result, Exception):
+                return None, f"Day {i} query failed: {str(result)}"
+            points, error = result
             if error:
-                return None, f"Failed for {day_start.date()}: {error}"
+                return None, f"Day {i} error: {error}"
             all_points.extend(points)
 
         if not all_points:
             return {"data": [], "granularity": "daily"}, None
 
+        # Sort all points chronologically
         all_points.sort(key=lambda x: x["timestamp"])
 
-        # Determine bucket size in seconds
         if days <= 1:
-            bucket_seconds = 3600                     # 1 hour
+            bucket_seconds = 3600      # 1 hour
+            granularity = "hourly"
         elif days <= 3:
-            bucket_seconds = 4 * 3600                  # 4 hours
+            bucket_seconds = 4 * 3600  # 4 hours
+            granularity = "4hourly"
         else:
-            bucket_seconds = 24 * 3600                 # 1 day
+            bucket_seconds = 24 * 3600 # 1 day
+            granularity = "daily"
 
-        from collections import defaultdict
         buckets = defaultdict(lambda: {
             "visitors": 0,
             "bandwidth_gb": 0.0,
@@ -217,17 +234,19 @@ class CloudflareCog(commands.Cog):
 
         for point in all_points:
             ts = datetime.fromisoformat(point["timestamp"].replace('Z', '+00:00'))
-            if bucket_seconds < 86400:
+
+            if bucket_seconds < 86400:   # less than a day
                 bucket_hours = bucket_seconds // 3600
                 bucket_ts = ts.replace(
                     minute=0, second=0, microsecond=0,
                     hour=(ts.hour // bucket_hours) * bucket_hours
                 )
-            else:
+            else:                         # daily bucket
                 bucket_ts = ts.replace(hour=0, minute=0, second=0, microsecond=0)
 
             bucket_key = bucket_ts.isoformat().replace('+00:00', 'Z')
             b = buckets[bucket_key]
+
             b["visitors"] += point["visitors"]
             b["bandwidth_gb"] += point["bandwidth_gb"]
             b["requests"] += point["requests"]
@@ -249,13 +268,6 @@ class CloudflareCog(commands.Cog):
                 "browsers": dict(b["browsers"]),
                 "os": dict(b["os"])
             })
-
-        if days <= 1:
-            granularity = "hourly"
-        elif days <= 3:
-            granularity = "4hourly"
-        else:
-            granularity = "daily"
 
         return {"data": aggregated, "granularity": granularity}, None
 
