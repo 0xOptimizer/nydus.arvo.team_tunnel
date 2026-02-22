@@ -192,6 +192,7 @@ class CloudflareCog(commands.Cog):
                 filter: { datetime_geq: $startTime },
                 orderBy: [datetime_ASC]
             ) {
+                count
                 dimensions {
                 datetime
                 clientCountryName
@@ -200,7 +201,6 @@ class CloudflareCog(commands.Cog):
                 clientDeviceType
                 }
                 sum {
-                requests
                 edgeResponseBytes
                 visits
                 }
@@ -230,13 +230,14 @@ class CloudflareCog(commands.Cog):
             for item in raw_stats:
                 dims = item.get('dimensions', {})
                 sums = item.get('sum', {})
+                request_count = item.get('count', 0)
                 v = sums.get('visits', 0)
                 
                 point = {
                     "timestamp": dims.get('datetime'),
                     "visitors": v,
                     "bandwidth_gb": round(sums.get('edgeResponseBytes', 0) / (1024**3), 4),
-                    "requests": sums.get('requests', 0),
+                    "requests": request_count,
                     "countries": {dims.get('clientCountryName', 'Unknown'): v},
                     "devices": {dims.get('clientDeviceType', 'Unknown'): v},
                     "browsers": {dims.get('userAgentBrowser', 'Unknown'): v},
