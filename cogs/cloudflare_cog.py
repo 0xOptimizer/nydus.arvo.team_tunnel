@@ -178,112 +178,97 @@ class CloudflareCog(commands.Cog):
 
     async def get_dynamic_analytics(self, days: int = 7) -> Tuple[Optional[Dict], Optional[str]]:
         if days > 7:
-            days = 7
+            days = 7  # Free plan limit
+
+        end_time = datetime.now(timezone.utc)
+        tasks = []
         
-        if days <= 1:
-            dataset = "httpRequestsAdaptiveGroups"
-            start_time = datetime.now(timezone.utc) - timedelta(hours=23, minutes=55)
-            query_fields = """
-                count
-                dimensions {
-                    datetime
-                    clientCountryName
-                    userAgentOS
-                    userAgentBrowser
-                    clientDeviceType
-                }
-                sum {
-                    edgeResponseBytes
-                    visits
-                }
-            """
-        else:
-            dataset = "httpRequests1hGroups"
-            start_time = datetime.now(timezone.utc) - timedelta(days=days)
-            query_fields = """
-                dimensions {
-                    datetime
-                    # clientCountryName is NOT available here
-                }
-                sum {
-                    requests
-                    edgeResponseBytes
-                    visits  # Test if this actually returns data
-                }
-            """
+        # Create one task per day (24-hour window)
+        for day_offset in range(days):
+            day_end = end_time - timedelta(days=day_offset)
+            day_start = day_end - timedelta(days=1)
+            tasks.append(self._query_day(day_start, day_end))
+        
+        # Run all queries concurrently (optional – removes sequentially)
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        
+        all_points = []
+        for i, result in enumerate(results):
+            if isinstance(result, Exception):
+                # Log error for day i, but continue with other days
+                print(f"Error on day {i}: {result}")
+                continue
+            if result:  # result is list of points
+                all_points.extend(result)
+        
+        # Sort chronologically (oldest first)
+        all_points.sort(key=lambda x: x["timestamp"])
+        
+        return {"data": all_points, "granularity": "daily"}, None
 
-        start_time_str = start_time.strftime('%Y-%m-%dT%H:%M:%SZ')
-
-        query = f"""
-        query GetDynamicStats($zoneTag: String!, $startTime: DateTime!) {{
-        viewer {{
-            zones(filter: {{ zoneTag: $zoneTag }}) {{
-            {dataset}(
-                limit: 1000,
-                filter: {{ datetime_geq: $startTime }},
-                orderBy: [datetime_ASC]
-            ) {{
-                {query_fields}
-            }}
-            }}
-        }}
-        }}
+    async def _query_day(self, start: datetime, end: datetime) -> List[Dict]:
+        """Query httpRequestsAdaptiveGroups for a single 24‑hour window."""
+        query = """
+        query GetDay($zoneTag: string!, $start: Time!, $end: Time!) {
+            viewer {
+                zones(filter: { zoneTag: $zoneTag }) {
+                    httpRequestsAdaptiveGroups(
+                        limit: 10000
+                        filter: { 
+                            datetime_geq: $start
+                            datetime_lt: $end
+                        }
+                        orderBy: [datetime_ASC]
+                    ) {
+                        count
+                        dimensions {
+                            datetime
+                            clientCountryName
+                            userAgentOS
+                            userAgentBrowser
+                            clientDeviceType
+                        }
+                        sum {
+                            edgeResponseBytes
+                            visits
+                        }
+                    }
+                }
+            }
+        }
         """
         
         variables = {
             "zoneTag": self.zone_id,
-            "startTime": start_time_str
+            "start": start.strftime('%Y-%m-%dT%H:%M:%SZ'),
+            "end": end.strftime('%Y-%m-%dT%H:%M:%SZ')
         }
-
+        
         data, error = await self._make_graphql_request(query, variables)
         if error:
-            return None, error
-
-        try:
-            zones = data.get('viewer', {}).get('zones', [])
-            if not zones:
-                return {"data": [], "granularity": "hourly"}, None
-
-            raw_stats = zones[0].get(dataset, [])
-            history = []
-
-            for item in raw_stats:
-                dims = item.get('dimensions', {})
-                sums = item.get('sum', {})
-                
-                if dataset == "httpRequestsAdaptiveGroups":
-                    reqs = item.get('count', 0)
-                    bytes_val = sums.get('edgeResponseBytes', 0)
-                    browser = dims.get('userAgentBrowser', 'Unknown')
-                    os = dims.get('userAgentOS', 'Unknown')
-                    device = dims.get('clientDeviceType', 'Unknown')
-                    # Country is available here
-                    country = dims.get('clientCountryName', 'Unknown')
-                else:
-                    reqs = sums.get('requests', 0)
-                    bytes_val = sums.get('edgeResponseBytes', 0)
-                    # These dimensions don't exist in 1h groups
-                    browser = "Unavailable"
-                    os = "Unavailable"
-                    device = "Unavailable"
-                    country = "Unavailable" 
-
-                v = sums.get('visits', 0)
-                point = {
-                    "timestamp": dims.get('datetime'),
-                    "visitors": v,
-                    "bandwidth_gb": round(bytes_val / (1024**3), 4) if bytes_val else 0,
-                    "requests": reqs,
-                    "countries": {country: v} if country != "Unavailable" else {},
-                    "devices": {device: v} if device != "Unavailable" else {},
-                    "browsers": {browser: v} if browser != "Unavailable" else {},
-                    "os": {os: v} if os != "Unavailable" else {}
-                }
-                history.append(point)
-
-            return {"data": history, "granularity": "hourly" if days <= 1 else "daily"}, None
-        except Exception as e:
-            return None, f"Parsing error: {str(e)}"
+            raise Exception(f"Query failed for {start.date()}: {error}")
+        
+        zones = data.get('viewer', {}).get('zones', [])
+        if not zones:
+            return []
+        
+        points = []
+        for item in zones[0].get('httpRequestsAdaptiveGroups', []):
+            dims = item.get('dimensions', {})
+            sums = item.get('sum', {})
+            point = {
+                "timestamp": dims.get('datetime'),
+                "visitors": sums.get('visits', 0),
+                "bandwidth_gb": round(sums.get('edgeResponseBytes', 0) / (1024**3), 4),
+                "requests": item.get('count', 0),
+                "countries": {dims.get('clientCountryName', 'Unknown'): sums.get('visits', 0)},
+                "devices": {dims.get('clientDeviceType', 'Unknown'): sums.get('visits', 0)},
+                "browsers": {dims.get('userAgentBrowser', 'Unknown'): sums.get('visits', 0)},
+                "os": {dims.get('userAgentOS', 'Unknown'): sums.get('visits', 0)}
+            }
+            points.append(point)
+        
+        return points
 
 def setup(bot):
     bot.add_cog(CloudflareCog(bot))
