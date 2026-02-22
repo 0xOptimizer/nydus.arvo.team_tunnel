@@ -183,31 +183,32 @@ class CloudflareCog(commands.Cog):
         start_time = datetime.now(timezone.utc) - timedelta(days=days)
         start_time_str = start_time.strftime('%Y-%m-%dT%H:%M:%SZ')
 
-        query = """
-        query GetDynamicStats($zoneTag: String!, $startTime: DateTime!) {
-        viewer {
-            zones(filter: { zoneTag: $zoneTag }) {
-            httpRequestsAdaptiveGroups(
+        if days <= 1:
+            dataset = "httpRequestsAdaptiveGroups"
+            dimensions = "datetime, clientCountryName, userAgentOS, userAgentBrowser, clientDeviceType"
+            metrics = "count, sum { edgeResponseBytes, visits }"
+        else:
+            dataset = "httpRequests1hGroups"
+            dimensions = "datetime, clientCountryName"
+            metrics = "sum { requests, edgeResponseBytes, visits }"
+
+        query = f"""
+        query GetDynamicStats($zoneTag: String!, $startTime: DateTime!) {{
+        viewer {{
+            zones(filter: {{ zoneTag: $zoneTag }}) {{
+            {dataset}(
                 limit: 1000,
-                filter: { datetime_geq: $startTime },
+                filter: {{ datetime_geq: $startTime }},
                 orderBy: [datetime_ASC]
-            ) {
-                count
-                dimensions {
-                datetime
-                clientCountryName
-                userAgentOS
-                userAgentBrowser
-                clientDeviceType
-                }
-                sum {
-                edgeResponseBytes
-                visits
-                }
-            }
-            }
-        }
-        }
+            ) {{
+                {metrics}
+                dimensions {{
+                {dimensions}
+                }}
+            }}
+            }}
+        }}
+        }}
         """
         
         variables = {
@@ -222,30 +223,40 @@ class CloudflareCog(commands.Cog):
         try:
             zones = data.get('viewer', {}).get('zones', [])
             if not zones:
-                return {"data": [], "granularity": "adaptive"}, None
+                return {"data": [], "granularity": "hourly"}, None
 
-            raw_stats = zones[0].get('httpRequestsAdaptiveGroups', [])
+            raw_stats = zones[0].get(dataset, [])
             history = []
 
             for item in raw_stats:
                 dims = item.get('dimensions', {})
                 sums = item.get('sum', {})
-                request_count = item.get('count', 0)
-                v = sums.get('visits', 0)
                 
+                if dataset == "httpRequestsAdaptiveGroups":
+                    reqs = item.get('count', 0)
+                    browser = dims.get('userAgentBrowser', 'Unknown')
+                    os = dims.get('userAgentOS', 'Unknown')
+                    device = dims.get('clientDeviceType', 'Unknown')
+                else:
+                    reqs = sums.get('requests', 0)
+                    browser = "Unavailable (>24h)"
+                    os = "Unavailable (>24h)"
+                    device = "Unavailable (>24h)"
+
+                v = sums.get('visits', 0)
                 point = {
                     "timestamp": dims.get('datetime'),
                     "visitors": v,
                     "bandwidth_gb": round(sums.get('edgeResponseBytes', 0) / (1024**3), 4),
-                    "requests": request_count,
+                    "requests": reqs,
                     "countries": {dims.get('clientCountryName', 'Unknown'): v},
-                    "devices": {dims.get('clientDeviceType', 'Unknown'): v},
-                    "browsers": {dims.get('userAgentBrowser', 'Unknown'): v},
-                    "os": {dims.get('userAgentOS', 'Unknown'): v}
+                    "devices": {device: v},
+                    "browsers": {browser: v},
+                    "os": {os: v}
                 }
                 history.append(point)
 
-            return {"data": history, "granularity": "hourly" if days <= 3 else "daily"}, None
+            return {"data": history, "granularity": "hourly" if days <= 1 else "daily"}, None
         except Exception as e:
             return None, f"Parsing error: {str(e)}"
 
