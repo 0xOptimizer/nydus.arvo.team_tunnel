@@ -176,21 +176,43 @@ class CloudflareCog(commands.Cog):
             return False, error
         return True, None
 
-    async def get_dynamic_analytics(self, days: int = 30) -> Tuple[Optional[Dict], Optional[str]]:
-        if days > 30:
-            days = 30
+    async def get_dynamic_analytics(self, days: int = 7) -> Tuple[Optional[Dict], Optional[str]]:
+        if days > 7:
+            days = 7
         
-        start_time = datetime.now(timezone.utc) - timedelta(days=days)
-        start_time_str = start_time.strftime('%Y-%m-%dT%H:%M:%SZ')
-
         if days <= 1:
             dataset = "httpRequestsAdaptiveGroups"
-            dimensions = "datetime, clientCountryName, userAgentOS, userAgentBrowser, clientDeviceType"
-            metrics = "count, sum { edgeResponseBytes, visits }"
+            start_time = datetime.now(timezone.utc) - timedelta(hours=23, minutes=55)
+            query_fields = """
+                count
+                dimensions {
+                datetime
+                clientCountryName
+                userAgentOS
+                userAgentBrowser
+                clientDeviceType
+                }
+                sum {
+                edgeResponseDelta
+                visits
+                }
+            """
         else:
             dataset = "httpRequests1hGroups"
-            dimensions = "datetime, clientCountryName"
-            metrics = "sum { requests, edgeResponseBytes, visits }"
+            start_time = datetime.now(timezone.utc) - timedelta(days=days)
+            query_fields = """
+                dimensions {
+                datetime
+                clientCountryName
+                }
+                sum {
+                requests
+                edgeResponseBytes
+                visits
+                }
+            """
+
+        start_time_str = start_time.strftime('%Y-%m-%dT%H:%M:%SZ')
 
         query = f"""
         query GetDynamicStats($zoneTag: String!, $startTime: DateTime!) {{
@@ -201,10 +223,7 @@ class CloudflareCog(commands.Cog):
                 filter: {{ datetime_geq: $startTime }},
                 orderBy: [datetime_ASC]
             ) {{
-                {metrics}
-                dimensions {{
-                {dimensions}
-                }}
+                {query_fields}
             }}
             }}
         }}
@@ -234,20 +253,22 @@ class CloudflareCog(commands.Cog):
                 
                 if dataset == "httpRequestsAdaptiveGroups":
                     reqs = item.get('count', 0)
+                    bytes_val = sums.get('edgeResponseDelta', 0)
                     browser = dims.get('userAgentBrowser', 'Unknown')
                     os = dims.get('userAgentOS', 'Unknown')
                     device = dims.get('clientDeviceType', 'Unknown')
                 else:
                     reqs = sums.get('requests', 0)
-                    browser = "Unavailable (>24h)"
-                    os = "Unavailable (>24h)"
-                    device = "Unavailable (>24h)"
+                    bytes_val = sums.get('edgeResponseBytes', 0)
+                    browser = "Unavailable"
+                    os = "Unavailable"
+                    device = "Unknown"
 
                 v = sums.get('visits', 0)
                 point = {
                     "timestamp": dims.get('datetime'),
                     "visitors": v,
-                    "bandwidth_gb": round(sums.get('edgeResponseBytes', 0) / (1024**3), 4),
+                    "bandwidth_gb": round(bytes_val / (1024**3), 4),
                     "requests": reqs,
                     "countries": {dims.get('clientCountryName', 'Unknown'): v},
                     "devices": {device: v},
