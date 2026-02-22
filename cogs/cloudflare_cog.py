@@ -193,7 +193,7 @@ class CloudflareCog(commands.Cog):
                 clientDeviceType
                 }
                 sum {
-                edgeResponseDelta
+                edgeResponseBytes
                 visits
                 }
             """
@@ -253,13 +253,13 @@ class CloudflareCog(commands.Cog):
                 
                 if dataset == "httpRequestsAdaptiveGroups":
                     reqs = item.get('count', 0)
-                    bytes_val = sums.get('edgeResponseDelta', 0)
+                    bytes_val = sums.get('edgeResponseBytes', 0) 
                     browser = dims.get('userAgentBrowser', 'Unknown')
                     os = dims.get('userAgentOS', 'Unknown')
                     device = dims.get('clientDeviceType', 'Unknown')
                 else:
                     reqs = sums.get('requests', 0)
-                    bytes_val = sums.get('edgeResponseBytes', 0)
+                    bytes_val = sums.get('edgeResponseBytes', 0) 
                     browser = "Unavailable"
                     os = "Unavailable"
                     device = "Unknown"
