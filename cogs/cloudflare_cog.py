@@ -186,15 +186,15 @@ class CloudflareCog(commands.Cog):
             query_fields = """
                 count
                 dimensions {
-                datetime
-                clientCountryName
-                userAgentOS
-                userAgentBrowser
-                clientDeviceType
+                    datetime
+                    clientCountryName
+                    userAgentOS
+                    userAgentBrowser
+                    clientDeviceType
                 }
                 sum {
-                edgeResponseBytes
-                visits
+                    edgeResponseBytes
+                    visits
                 }
             """
         else:
@@ -202,13 +202,13 @@ class CloudflareCog(commands.Cog):
             start_time = datetime.now(timezone.utc) - timedelta(days=days)
             query_fields = """
                 dimensions {
-                datetime
-                clientCountryName
+                    datetime
+                    # clientCountryName is NOT available here
                 }
                 sum {
-                requests
-                edgeResponseBytes
-                visits
+                    requests
+                    edgeResponseBytes
+                    visits  # Test if this actually returns data
                 }
             """
 
@@ -253,27 +253,31 @@ class CloudflareCog(commands.Cog):
                 
                 if dataset == "httpRequestsAdaptiveGroups":
                     reqs = item.get('count', 0)
-                    bytes_val = sums.get('edgeResponseBytes', 0) 
+                    bytes_val = sums.get('edgeResponseBytes', 0)
                     browser = dims.get('userAgentBrowser', 'Unknown')
                     os = dims.get('userAgentOS', 'Unknown')
                     device = dims.get('clientDeviceType', 'Unknown')
+                    # Country is available here
+                    country = dims.get('clientCountryName', 'Unknown')
                 else:
                     reqs = sums.get('requests', 0)
-                    bytes_val = sums.get('edgeResponseBytes', 0) 
+                    bytes_val = sums.get('edgeResponseBytes', 0)
+                    # These dimensions don't exist in 1h groups
                     browser = "Unavailable"
                     os = "Unavailable"
-                    device = "Unknown"
+                    device = "Unavailable"
+                    country = "Unavailable" 
 
                 v = sums.get('visits', 0)
                 point = {
                     "timestamp": dims.get('datetime'),
                     "visitors": v,
-                    "bandwidth_gb": round(bytes_val / (1024**3), 4),
+                    "bandwidth_gb": round(bytes_val / (1024**3), 4) if bytes_val else 0,
                     "requests": reqs,
-                    "countries": {dims.get('clientCountryName', 'Unknown'): v},
-                    "devices": {device: v},
-                    "browsers": {browser: v},
-                    "os": {os: v}
+                    "countries": {country: v} if country != "Unavailable" else {},
+                    "devices": {device: v} if device != "Unavailable" else {},
+                    "browsers": {browser: v} if browser != "Unavailable" else {},
+                    "os": {os: v} if os != "Unavailable" else {}
                 }
                 history.append(point)
 
