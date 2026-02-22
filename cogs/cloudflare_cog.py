@@ -188,8 +188,7 @@ class CloudflareCog(commands.Cog):
             day_start = day_end - timedelta(days=1)
             points, error = await self._query_day(day_start, day_end)
             if error:
-                # Log error if needed, but continue to avoid data gaps
-                continue
+                return None, f"Failed for {day_start.date()}: {error}"
             all_points.extend(points)
 
         if not all_points:
@@ -197,12 +196,13 @@ class CloudflareCog(commands.Cog):
 
         all_points.sort(key=lambda x: x["timestamp"])
 
+        # Determine bucket size in seconds
         if days <= 1:
-            bucket_seconds = 3600 # 1 hour
+            bucket_seconds = 3600                     # 1 hour
         elif days <= 3:
-            bucket_seconds = 4 * 3600 # 4 hours
+            bucket_seconds = 4 * 3600                  # 4 hours
         else:
-            bucket_seconds = 24 * 3600 # 1 day
+            bucket_seconds = 24 * 3600                 # 1 day
 
         from collections import defaultdict
         buckets = defaultdict(lambda: {
@@ -227,7 +227,6 @@ class CloudflareCog(commands.Cog):
                 bucket_ts = ts.replace(hour=0, minute=0, second=0, microsecond=0)
 
             bucket_key = bucket_ts.isoformat().replace('+00:00', 'Z')
-
             b = buckets[bucket_key]
             b["visitors"] += point["visitors"]
             b["bandwidth_gb"] += point["bandwidth_gb"]
@@ -260,8 +259,10 @@ class CloudflareCog(commands.Cog):
 
         return {"data": aggregated, "granularity": granularity}, None
 
-    async def _query_day(self, start: datetime, end: datetime) -> List[Dict]:
-        """Query httpRequestsAdaptiveGroups for a single 24‑hour window."""
+    async def _query_day(self, start: datetime, end: datetime) -> Tuple[List[Dict], Optional[str]]:
+        """Query httpRequestsAdaptiveGroups for a single 24-hour window.
+        Returns (points, error) tuple.
+        """
         query = """
         query GetDay($zoneTag: string!, $start: Time!, $end: Time!) {
             viewer {
@@ -298,13 +299,18 @@ class CloudflareCog(commands.Cog):
             "end": end.strftime('%Y-%m-%dT%H:%M:%SZ')
         }
         
-        data, error = await self._make_graphql_request(query, variables)
+        try:
+            data, error = await self._make_graphql_request(query, variables)
+        except Exception as e:
+            # Catch any unpacking or other unexpected errors
+            return [], f"Unexpected error: {str(e)}"
+        
         if error:
-            raise Exception(f"Query failed for {start.date()}: {error}")
+            return [], error
         
         zones = data.get('viewer', {}).get('zones', [])
         if not zones:
-            return []
+            return [], None
         
         points = []
         for item in zones[0].get('httpRequestsAdaptiveGroups', []):
@@ -322,7 +328,7 @@ class CloudflareCog(commands.Cog):
             }
             points.append(point)
         
-        return points
+        return points, None
 
 def setup(bot):
     bot.add_cog(CloudflareCog(bot))
