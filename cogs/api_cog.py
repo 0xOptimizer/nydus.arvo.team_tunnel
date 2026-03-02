@@ -86,8 +86,8 @@ class ApiCog(commands.Cog):
         self.public_app.router.add_post('/webhook/{uuid}', self.handle_webhook)
         self.public_app.router.add_get('/api/maintenance/logs/{service}', self.handle_get_logs)
         self.public_app.router.add_get('/api/maintenance/restart/{service}', self.handle_restart_service)
-        self.public_app.router.add_get('/messenger', self.handle_messenger_verification)
-        self.public_app.router.add_post('/messenger', self.handle_messenger_webhook)
+        self.public_app.router.add_get('/api/messenger', self.handle_messenger_verification)
+        self.public_app.router.add_post('/api/messenger', self.handle_messenger_webhook)
 
     # ------------------------------
     # INTERNAL SERVER
