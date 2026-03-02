@@ -68,6 +68,8 @@ class ApiCog(commands.Cog):
         self.internal_app.router.add_get('/api/maintenance/restart/{service}', self.handle_restart_service)
         self.internal_app.router.add_post('/api/toggle-public', self.handle_toggle_public)
         self.internal_app.router.add_get('/api/public-status', self.handle_public_status)
+        self.internal_app.router.add_get('/api/messenger', self.handle_messenger_verification)
+        self.internal_app.router.add_post('/api/messenger', self.handle_messenger_webhook)
 
         # Public server routes (same handlers, auth applied via middleware)
         self.public_app.router.add_options('/{tail:.*}', self.handle_options)
