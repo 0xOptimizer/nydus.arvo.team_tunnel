@@ -482,7 +482,7 @@ class ApiCog(commands.Cog):
             return self.json_response({'error': str(e)}, status=500)
 
     # ------------------------------
-    # CLOUDFLARE
+    # MESSENGER API
     # ------------------------------
     async def handle_messenger_verification(self, request):
         hub_mode = request.query.get('hub.mode')
@@ -495,7 +495,11 @@ class ApiCog(commands.Cog):
             return self.json_response({'error': 'Verify token not configured'}, status=500)
 
         if hub_mode == 'subscribe' and hub_verify_token == verify_token:
-            return web.Response(text=hub_challenge)
+            return web.Response(
+                status=200,
+                text=hub_challenge,
+                headers={'Content-Type': 'text/plain'}
+            )
         else:
             return web.Response(status=403, text='Verification failed')
 
