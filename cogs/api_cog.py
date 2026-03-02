@@ -86,6 +86,8 @@ class ApiCog(commands.Cog):
         self.public_app.router.add_post('/webhook/{uuid}', self.handle_webhook)
         self.public_app.router.add_get('/api/maintenance/logs/{service}', self.handle_get_logs)
         self.public_app.router.add_get('/api/maintenance/restart/{service}', self.handle_restart_service)
+        self.public_app.router.add_get('/messenger', self.handle_messenger_verification)
+        self.public_app.router.add_post('/messenger', self.handle_messenger_webhook)
 
     # ------------------------------
     # INTERNAL SERVER
@@ -478,6 +480,58 @@ class ApiCog(commands.Cog):
             import traceback
             traceback.print_exc()
             return self.json_response({'error': str(e)}, status=500)
+
+    # ------------------------------
+    # CLOUDFLARE
+    # ------------------------------
+    async def handle_messenger_verification(self, request):
+        hub_mode = request.query.get('hub.mode')
+        hub_challenge = request.query.get('hub.challenge')
+        hub_verify_token = request.query.get('hub.verify_token')
+
+        verify_token = os.getenv('META_APP_MESSENGER_VERIFY_TOKEN')
+
+        if not verify_token:
+            return self.json_response({'error': 'Verify token not configured'}, status=500)
+
+        if hub_mode == 'subscribe' and hub_verify_token == verify_token:
+            return web.Response(text=hub_challenge)
+        else:
+            return web.Response(status=403, text='Verification failed')
+
+    async def handle_messenger_webhook(self, request):
+        if request.path == '/messenger' and request.method == 'POST':
+            pass
+        else:
+            auth_key = request.headers.get('X-Auth-Key')
+            if not auth_key:
+                return self.json_response({'error': 'Missing X-Auth-Key'}, status=401)
+
+        try:
+            data = await request.json()
+            self.logger.info(f"Received Messenger webhook data: {data}")
+
+            if 'entry' in data and data['entry']:
+                for entry in data['entry']:
+                    if 'messaging' in entry:
+                        for messaging_event in entry['messaging']:
+                            if 'message' in messaging_event and messaging_event['message'].get('text'):
+                                message_text = messaging_event['message']['text']
+                                sender_id = messaging_event['sender']['id']
+                                await self.echo_to_discord(f"Message from Facebook user {sender_id}: {message_text}")
+
+            return self.json_response({'status': 'success'})
+        except Exception as e:
+            self.logger.error(f"Error handling Messenger webhook: {str(e)}")
+            return self.json_response({'error': str(e)}, status=500)
+
+    async def echo_to_discord(self, message):
+        channel_id = 981071936157286421
+        channel = self.bot.get_channel(channel_id)
+        if channel:
+            await channel.send(message)
+        else:
+            self.logger.error(f"Could not find channel with ID {channel_id}")
 
 def setup(bot):
     bot.add_cog(ApiCog(bot))
