@@ -311,3 +311,374 @@ async def log_slash_command(
             error_message
         )
     )
+
+# =====================================================
+# Database Management (database_creations)
+# =====================================================
+
+async def create_database(database_name: str, allowed_hosts: str, database_type: str, created_by: str) -> dict | None:
+    """
+    Create a new database record in database_creations.
+    Returns a dict with database_uuid on success, None on failure.
+    """
+    database_uuid = str(uuid.uuid4())
+    query = """
+        INSERT INTO database_creations
+        (database_uuid, database_name, allowed_hosts, database_type, created_by)
+        VALUES (%s, %s, %s, %s, %s)
+    """
+    params = (database_uuid, database_name, allowed_hosts, database_type, created_by)
+    result = await execute_query(query, params)
+    if result:
+        return {
+            "database_uuid": database_uuid,
+            "database_name": database_name,
+            "allowed_hosts": allowed_hosts,
+            "database_type": database_type,
+            "created_by": created_by
+        }
+    return None
+
+async def get_database(database_uuid: str = None, database_name: str = None) -> dict | None:
+    """
+    Fetch a single database record by UUID or name.
+    Only returns non-deleted records (deleted_at IS NULL).
+    """
+    if database_uuid:
+        query = "SELECT * FROM database_creations WHERE database_uuid = %s AND deleted_at IS NULL"
+        params = (database_uuid,)
+    elif database_name:
+        query = "SELECT * FROM database_creations WHERE database_name = %s AND deleted_at IS NULL"
+        params = (database_name,)
+    else:
+        return None
+    return await execute_query(query, params, fetch_one=True)
+
+async def get_all_databases(include_deleted: bool = False) -> list | None:
+    """
+    Fetch all database records, optionally including soft-deleted ones.
+    """
+    if include_deleted:
+        query = "SELECT * FROM database_creations ORDER BY created_at DESC"
+    else:
+        query = "SELECT * FROM database_creations WHERE deleted_at IS NULL ORDER BY created_at DESC"
+    return await execute_query(query, fetch_all=True)
+
+async def update_database(database_uuid: str, allowed_hosts: str = None, database_name: str = None, updated_by: str = None) -> bool:
+    """
+    Update allowed_hosts and/or database_name of a database.
+    Returns True if at least one row was updated, False otherwise.
+    """
+    updates = []
+    params = []
+    if allowed_hosts is not None:
+        updates.append("allowed_hosts = %s")
+        params.append(allowed_hosts)
+    if database_name is not None:
+        updates.append("database_name = %s")
+        params.append(database_name)
+    if updated_by is not None:
+        updates.append("updated_by = %s")
+        params.append(updated_by)
+    if not updates:
+        return False
+    query = f"UPDATE database_creations SET {', '.join(updates)} WHERE database_uuid = %s AND deleted_at IS NULL"
+    params.append(database_uuid)
+    result = await execute_query(query, tuple(params))
+    # execute_query returns lastrowid for updates, which is non-zero if a row was affected.
+    return bool(result)
+
+async def soft_delete_database(database_uuid: str, deleted_by: str) -> bool:
+    """
+    Soft delete a database by setting deleted_at and deleted_by.
+    Returns True if successful.
+    """
+    query = "UPDATE database_creations SET deleted_at = CURRENT_TIMESTAMP, deleted_by = %s WHERE database_uuid = %s AND deleted_at IS NULL"
+    result = await execute_query(query, (deleted_by, database_uuid))
+    return bool(result)
+
+async def hard_delete_database(database_uuid: str) -> bool:
+    """
+    Permanently delete a database record. Use with caution – cascades to backups and privileges.
+    Returns True if successful.
+    """
+    query = "DELETE FROM database_creations WHERE database_uuid = %s"
+    result = await execute_query(query, (database_uuid,))
+    return bool(result)
+
+
+# =====================================================
+# Database Users (database_users)
+# =====================================================
+
+async def create_database_user(username: str, password_encrypted: str, created_by: str) -> dict | None:
+    """
+    Create a new database user record.
+    Returns a dict with user_uuid on success.
+    """
+    user_uuid = str(uuid.uuid4())
+    query = """
+        INSERT INTO database_users
+        (user_uuid, username, password_encrypted, created_by)
+        VALUES (%s, %s, %s, %s)
+    """
+    params = (user_uuid, username, password_encrypted, created_by)
+    result = await execute_query(query, params)
+    if result:
+        return {
+            "user_uuid": user_uuid,
+            "username": username,
+            "created_by": created_by
+        }
+    return None
+
+async def get_database_user(user_uuid: str = None, username: str = None) -> dict | None:
+    """
+    Fetch a single database user by UUID or username.
+    Only returns non-deleted users.
+    """
+    if user_uuid:
+        query = "SELECT * FROM database_users WHERE user_uuid = %s AND deleted_at IS NULL"
+        params = (user_uuid,)
+    elif username:
+        query = "SELECT * FROM database_users WHERE username = %s AND deleted_at IS NULL"
+        params = (username,)
+    else:
+        return None
+    return await execute_query(query, params, fetch_one=True)
+
+async def get_all_database_users(include_deleted: bool = False) -> list | None:
+    """
+    Fetch all database users.
+    """
+    if include_deleted:
+        query = "SELECT * FROM database_users ORDER BY created_at DESC"
+    else:
+        query = "SELECT * FROM database_users WHERE deleted_at IS NULL ORDER BY created_at DESC"
+    return await execute_query(query, fetch_all=True)
+
+async def update_database_user(user_uuid: str, username: str = None, password_encrypted: str = None, updated_by: str = None) -> bool:
+    """
+    Update username and/or password of a user.
+    """
+    updates = []
+    params = []
+    if username is not None:
+        updates.append("username = %s")
+        params.append(username)
+    if password_encrypted is not None:
+        updates.append("password_encrypted = %s")
+        params.append(password_encrypted)
+    if updated_by is not None:
+        updates.append("updated_by = %s")
+        params.append(updated_by)
+    if not updates:
+        return False
+    query = f"UPDATE database_users SET {', '.join(updates)} WHERE user_uuid = %s AND deleted_at IS NULL"
+    params.append(user_uuid)
+    result = await execute_query(query, tuple(params))
+    return bool(result)
+
+async def soft_delete_database_user(user_uuid: str, deleted_by: str) -> bool:
+    """
+    Soft delete a user.
+    """
+    query = "UPDATE database_users SET deleted_at = CURRENT_TIMESTAMP, deleted_by = %s WHERE user_uuid = %s AND deleted_at IS NULL"
+    result = await execute_query(query, (deleted_by, user_uuid))
+    return bool(result)
+
+async def hard_delete_database_user(user_uuid: str) -> bool:
+    """
+    Permanently delete a user record (cascades to privileges).
+    """
+    query = "DELETE FROM database_users WHERE user_uuid = %s"
+    result = await execute_query(query, (user_uuid,))
+    return bool(result)
+
+
+# =====================================================
+# Database User Privileges (database_user_privileges)
+# =====================================================
+
+async def grant_database_privileges(database_uuid: str, user_uuid: str, privileges: str, granted_by: str) -> bool:
+    """
+    Grant privileges to a user on a database.
+    This will automatically revoke any currently active privileges for the same (database, user) pair.
+    Returns True on success.
+    """
+    # First, revoke any existing active privileges
+    revoke_query = """
+        UPDATE database_user_privileges
+        SET revoked_at = CURRENT_TIMESTAMP, revoked_by = %s
+        WHERE database_uuid = %s AND user_uuid = %s AND revoked_at IS NULL
+    """
+    await execute_query(revoke_query, (granted_by, database_uuid, user_uuid))
+
+    # Then insert the new grant
+    insert_query = """
+        INSERT INTO database_user_privileges
+        (database_uuid, user_uuid, privileges, granted_by)
+        VALUES (%s, %s, %s, %s)
+    """
+    result = await execute_query(insert_query, (database_uuid, user_uuid, privileges, granted_by))
+    return bool(result)
+
+async def revoke_database_privileges(database_uuid: str, user_uuid: str, revoked_by: str) -> bool:
+    """
+    Revoke all active privileges for a specific database-user pair.
+    """
+    query = """
+        UPDATE database_user_privileges
+        SET revoked_at = CURRENT_TIMESTAMP, revoked_by = %s
+        WHERE database_uuid = %s AND user_uuid = %s AND revoked_at IS NULL
+    """
+    result = await execute_query(query, (revoked_by, database_uuid, user_uuid))
+    return bool(result)
+
+async def get_database_privileges(database_uuid: str = None, user_uuid: str = None, include_revoked: bool = False) -> list | None:
+    """
+    Fetch privilege records.
+    If both database_uuid and user_uuid are None, returns all privileges (use with caution).
+    You can filter by database, user, or both.
+    By default returns only active (revoked_at IS NULL) privileges.
+    """
+    conditions = []
+    params = []
+    if database_uuid:
+        conditions.append("database_uuid = %s")
+        params.append(database_uuid)
+    if user_uuid:
+        conditions.append("user_uuid = %s")
+        params.append(user_uuid)
+    if not include_revoked:
+        conditions.append("revoked_at IS NULL")
+
+    where_clause = "WHERE " + " AND ".join(conditions) if conditions else ""
+    query = f"SELECT * FROM database_user_privileges {where_clause} ORDER BY granted_at DESC"
+    return await execute_query(query, tuple(params), fetch_all=True)
+
+async def get_active_privileges_for_database(database_uuid: str) -> list | None:
+    """Get all active privilege rows for a given database (including user details)."""
+    query = """
+        SELECT p.*, u.username
+        FROM database_user_privileges p
+        JOIN database_users u ON p.user_uuid = u.user_uuid
+        WHERE p.database_uuid = %s AND p.revoked_at IS NULL AND u.deleted_at IS NULL
+        ORDER BY p.granted_at DESC
+    """
+    return await execute_query(query, (database_uuid,), fetch_all=True)
+
+
+# =====================================================
+# Database Backups (database_backups) – with soft delete
+# =====================================================
+
+async def create_backup(
+    target_database_uuid: str,
+    file_name: str,
+    file_path: str,
+    file_size_bytes: int = None,
+    checksum: str = None,
+    status: str = 'pending'
+) -> dict | None:
+    """
+    Create a new backup record.
+    Returns a dict with backup_uuid on success.
+    """
+    backup_uuid = str(uuid.uuid4())
+    query = """
+        INSERT INTO database_backups
+        (backup_uuid, target_database_uuid, file_name, file_path, file_size_bytes, checksum, status)
+        VALUES (%s, %s, %s, %s, %s, %s, %s)
+    """
+    params = (backup_uuid, target_database_uuid, file_name, file_path, file_size_bytes, checksum, status)
+    result = await execute_query(query, params)
+    if result:
+        return {
+            "backup_uuid": backup_uuid,
+            "target_database_uuid": target_database_uuid,
+            "file_name": file_name,
+            "file_path": file_path,
+            "file_size_bytes": file_size_bytes,
+            "checksum": checksum,
+            "status": status
+        }
+    return None
+
+async def update_backup_status(backup_uuid: str, status: str, file_size_bytes: int = None, checksum: str = None) -> bool:
+    """
+    Update the status and optionally file_size_bytes/checksum of a backup.
+    """
+    updates = ["status = %s"]
+    params = [status]
+    if file_size_bytes is not None:
+        updates.append("file_size_bytes = %s")
+        params.append(file_size_bytes)
+    if checksum is not None:
+        updates.append("checksum = %s")
+        params.append(checksum)
+    params.append(backup_uuid)
+    query = f"UPDATE database_backups SET {', '.join(updates)} WHERE backup_uuid = %s"
+    result = await execute_query(query, tuple(params))
+    return bool(result)
+
+async def get_backup(backup_uuid: str, include_deleted: bool = False) -> dict | None:
+    """
+    Fetch a single backup record by UUID.
+    By default excludes soft‑deleted backups unless include_deleted=True.
+    """
+    if include_deleted:
+        query = "SELECT * FROM database_backups WHERE backup_uuid = %s"
+    else:
+        query = "SELECT * FROM database_backups WHERE backup_uuid = %s AND deleted_at IS NULL"
+    return await execute_query(query, (backup_uuid,), fetch_one=True)
+
+async def get_backups_for_database(database_uuid: str, limit: int = 10, include_deleted: bool = False) -> list | None:
+    """
+    Fetch the most recent backups for a given database.
+    By default excludes soft‑deleted backups unless include_deleted=True.
+    """
+    if include_deleted:
+        query = """
+            SELECT * FROM database_backups
+            WHERE target_database_uuid = %s
+            ORDER BY created_at DESC
+            LIMIT %s
+        """
+    else:
+        query = """
+            SELECT * FROM database_backups
+            WHERE target_database_uuid = %s AND deleted_at IS NULL
+            ORDER BY created_at DESC
+            LIMIT %s
+        """
+    return await execute_query(query, (database_uuid, limit), fetch_all=True)
+
+async def soft_delete_backup(backup_uuid: str, deleted_by: str = None) -> bool:
+    """
+    Soft delete a backup by setting deleted_at (and optionally deleted_by).
+    Returns True if successful.
+    """
+    if deleted_by:
+        query = "UPDATE database_backups SET deleted_at = CURRENT_TIMESTAMP, deleted_by = %s WHERE backup_uuid = %s AND deleted_at IS NULL"
+        params = (deleted_by, backup_uuid)
+    else:
+        query = "UPDATE database_backups SET deleted_at = CURRENT_TIMESTAMP WHERE backup_uuid = %s AND deleted_at IS NULL"
+        params = (backup_uuid,)
+    result = await execute_query(query, params)
+    return bool(result)
+
+async def soft_delete_backups_for_database(database_uuid: str, deleted_by: str = None) -> bool:
+    """
+    Soft delete all active backups for a given database.
+    Useful when the database itself is soft‑deleted.
+    Returns True if at least one backup was updated.
+    """
+    if deleted_by:
+        query = "UPDATE database_backups SET deleted_at = CURRENT_TIMESTAMP, deleted_by = %s WHERE target_database_uuid = %s AND deleted_at IS NULL"
+        params = (deleted_by, database_uuid)
+    else:
+        query = "UPDATE database_backups SET deleted_at = CURRENT_TIMESTAMP WHERE target_database_uuid = %s AND deleted_at IS NULL"
+        params = (database_uuid,)
+    result = await execute_query(query, params)
+    return bool(result)
