@@ -388,22 +388,13 @@ async def update_database(database_uuid: str, allowed_hosts: str = None, databas
     # execute_query returns lastrowid for updates, which is non-zero if a row was affected.
     return bool(result)
 
-async def soft_delete_database(database_uuid: str, deleted_by: str) -> bool:
+async def delete_database(database_uuid: str, deleted_by: str) -> bool:
     """
     Soft delete a database by setting deleted_at and deleted_by.
     Returns True if successful.
     """
     query = "UPDATE database_creations SET deleted_at = CURRENT_TIMESTAMP, deleted_by = %s WHERE database_uuid = %s AND deleted_at IS NULL"
     result = await execute_query(query, (deleted_by, database_uuid))
-    return bool(result)
-
-async def hard_delete_database(database_uuid: str) -> bool:
-    """
-    Permanently delete a database record. Use with caution – cascades to backups and privileges.
-    Returns True if successful.
-    """
-    query = "DELETE FROM database_creations WHERE database_uuid = %s"
-    result = await execute_query(query, (database_uuid,))
     return bool(result)
 
 
@@ -646,7 +637,7 @@ async def get_backups_for_database(database_uuid: str, limit: int = 10, include_
         """
     return await execute_query(query, (database_uuid, limit), fetch_all=True)
 
-async def soft_delete_backup(backup_uuid: str, deleted_by: str = None) -> bool:
+async def delete_backup(backup_uuid: str, deleted_by: str = None) -> bool:
     """
     Soft delete a backup by setting deleted_at (and optionally deleted_by).
     Returns True if successful.
@@ -660,7 +651,7 @@ async def soft_delete_backup(backup_uuid: str, deleted_by: str = None) -> bool:
     result = await execute_query(query, params)
     return bool(result)
 
-async def soft_delete_backups_for_database(database_uuid: str, deleted_by: str = None) -> bool:
+async def delete_backups_for_database(database_uuid: str, deleted_by: str = None) -> bool:
     """
     Soft delete all active backups for a given database.
     Useful when the database itself is soft‑deleted.
