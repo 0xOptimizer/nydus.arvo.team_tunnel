@@ -479,20 +479,12 @@ async def update_database_user(user_uuid: str, username: str = None, password_en
     result = await execute_query(query, tuple(params))
     return bool(result)
 
-async def soft_delete_database_user(user_uuid: str, deleted_by: str) -> bool:
+async def delete_database_user(user_uuid: str, deleted_by: str) -> bool:
     """
     Soft delete a user.
     """
     query = "UPDATE database_users SET deleted_at = CURRENT_TIMESTAMP, deleted_by = %s WHERE user_uuid = %s AND deleted_at IS NULL"
     result = await execute_query(query, (deleted_by, user_uuid))
-    return bool(result)
-
-async def hard_delete_database_user(user_uuid: str) -> bool:
-    """
-    Permanently delete a user record (cascades to privileges).
-    """
-    query = "DELETE FROM database_users WHERE user_uuid = %s"
-    result = await execute_query(query, (user_uuid,))
     return bool(result)
 
 
