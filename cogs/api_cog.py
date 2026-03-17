@@ -1,3 +1,4 @@
+import traceback
 from discord.ext import commands, tasks
 from aiohttp import web
 import os
@@ -48,48 +49,43 @@ class ApiCog(commands.Cog):
     # ------------------------------
     # ROUTES
     # ------------------------------
-    def setup_routes(self):
-        # Internal server routes
-        self.internal_app.router.add_options('/{tail:.*}', self.handle_options)
-        self.internal_app.router.add_post('/api/auth/check-user', self.handle_check_user)
-        self.internal_app.router.add_get('/api/stats', self.handle_get_system_resources)
-        self.internal_app.router.add_get('/api/cloudflare/records', self.handle_get_dns_records)
-        self.internal_app.router.add_post('/api/cloudflare/records', self.handle_create_dns_record)
-        self.internal_app.router.add_put('/api/cloudflare/records/{record_id}', self.handle_update_dns_record)
-        self.internal_app.router.add_delete('/api/cloudflare/records/{record_id}', self.handle_delete_dns_record)
-        self.internal_app.router.add_get('/api/cloudflare/analytics', self.handle_get_analytics)
-        self.internal_app.router.add_get('/api/cloudflare/dynamic-analytics', self.handle_get_dynamic_analytics)
-        self.internal_app.router.add_get('/api/github-projects', self.handle_get_github_projects)
-        self.internal_app.router.add_post('/api/github-projects', self.handle_create_github_project)
-        self.internal_app.router.add_delete('/api/github-projects/{uuid}', self.handle_delete_github_project)
-        self.internal_app.router.add_get('/api/attached-projects', self.handle_get_attached_projects)
-        self.internal_app.router.add_post('/webhook/{uuid}', self.handle_webhook)
-        self.internal_app.router.add_get('/api/maintenance/logs/{service}', self.handle_get_logs)
-        self.internal_app.router.add_get('/api/maintenance/restart/{service}', self.handle_restart_service)
-        self.internal_app.router.add_post('/api/toggle-public', self.handle_toggle_public)
-        self.internal_app.router.add_get('/api/public-status', self.handle_public_status)
-        self.internal_app.router.add_get('/api/messenger', self.handle_messenger_verification)
-        self.internal_app.router.add_post('/api/messenger', self.handle_messenger_webhook)
+    def _add_route(self, method: str, path: str, handler):
+        self.internal_app.router.add_route(method, path, handler)
+        self.public_app.router.add_route(method, path, handler)
 
-        # Public server routes (same handlers, auth applied via middleware)
-        self.public_app.router.add_options('/{tail:.*}', self.handle_options)
-        self.public_app.router.add_post('/api/auth/check-user', self.handle_check_user)
-        self.public_app.router.add_get('/api/stats', self.handle_get_system_resources)
-        self.public_app.router.add_get('/api/cloudflare/records', self.handle_get_dns_records)
-        self.public_app.router.add_post('/api/cloudflare/records', self.handle_create_dns_record)
-        self.public_app.router.add_put('/api/cloudflare/records/{record_id}', self.handle_update_dns_record)
-        self.public_app.router.add_delete('/api/cloudflare/records/{record_id}', self.handle_delete_dns_record)
-        self.public_app.router.add_get('/api/cloudflare/analytics', self.handle_get_analytics)
-        self.public_app.router.add_get('/api/cloudflare/dynamic-analytics', self.handle_get_dynamic_analytics)
-        self.public_app.router.add_get('/api/github-projects', self.handle_get_github_projects)
-        self.public_app.router.add_post('/api/github-projects', self.handle_create_github_project)
-        self.public_app.router.add_delete('/api/github-projects/{uuid}', self.handle_delete_github_project)
-        self.public_app.router.add_get('/api/attached-projects', self.handle_get_attached_projects)
-        self.public_app.router.add_post('/webhook/{uuid}', self.handle_webhook)
-        self.public_app.router.add_get('/api/maintenance/logs/{service}', self.handle_get_logs)
-        self.public_app.router.add_get('/api/maintenance/restart/{service}', self.handle_restart_service)
-        self.public_app.router.add_get('/api/messenger', self.handle_messenger_verification)
-        self.public_app.router.add_post('/api/messenger', self.handle_messenger_webhook)
+    def setup_routes(self):
+        self._add_route('OPTIONS', '/{tail:.*}', self.handle_options)
+        self._add_route('POST', '/api/auth/check-user', self.handle_check_user)
+        self._add_route('GET', '/api/stats', self.handle_get_system_resources)
+        self._add_route('GET', '/api/cloudflare/records', self.handle_get_dns_records)
+        self._add_route('POST', '/api/cloudflare/records', self.handle_create_dns_record)
+        self._add_route('PUT', '/api/cloudflare/records/{record_id}', self.handle_update_dns_record)
+        self._add_route('DELETE', '/api/cloudflare/records/{record_id}', self.handle_delete_dns_record)
+        self._add_route('GET', '/api/cloudflare/analytics', self.handle_get_analytics)
+        self._add_route('GET', '/api/cloudflare/dynamic-analytics', self.handle_get_dynamic_analytics)
+        self._add_route('GET', '/api/github-projects', self.handle_get_github_projects)
+        self._add_route('POST', '/api/github-projects', self.handle_create_github_project)
+        self._add_route('DELETE', '/api/github-projects/{uuid}', self.handle_delete_github_project)
+        self._add_route('GET', '/api/attached-projects', self.handle_get_attached_projects)
+        self._add_route('POST', '/webhook/{uuid}', self.handle_webhook)
+        self._add_route('GET', '/api/maintenance/logs/{service}', self.handle_get_logs)
+        self._add_route('GET', '/api/maintenance/restart/{service}', self.handle_restart_service)
+        self._add_route('POST', '/api/toggle-public', self.handle_toggle_public)
+        self._add_route('GET', '/api/public-status', self.handle_public_status)
+        self._add_route('GET', '/api/messenger', self.handle_messenger_verification)
+        self._add_route('POST', '/api/messenger', self.handle_messenger_webhook)
+
+        # Database management routes
+        self._add_route('GET', '/api/databases', self.handle_get_databases)
+        self._add_route('GET', '/api/databases/{uuid}', self.handle_get_database)
+        self._add_route('POST', '/api/databases', self.handle_create_database)
+        self._add_route('DELETE', '/api/databases/{uuid}', self.handle_delete_database)
+        self._add_route('POST', '/api/databases/users', self.handle_create_database_user)
+        self._add_route('DELETE', '/api/databases/users/{user_uuid}', self.handle_delete_database_user)
+        self._add_route('POST', '/api/databases/{uuid}/privileges', self.handle_grant_privileges)
+        self._add_route('DELETE', '/api/databases/{uuid}/privileges/{user_uuid}', self.handle_revoke_privileges)
+        self._add_route('POST', '/api/databases/{uuid}/backup', self.handle_perform_backup)
+        self._add_route('POST', '/api/databases/{uuid}/restore', self.handle_restore_backup)
 
     # ------------------------------
     # INTERNAL SERVER
@@ -479,7 +475,6 @@ class ApiCog(commands.Cog):
                 return self.json_response({'error': error}, status=400)
             return self.json_response(stats)
         except Exception as e:
-            import traceback
             traceback.print_exc()
             return self.json_response({'error': str(e)}, status=500)
 
@@ -506,13 +501,6 @@ class ApiCog(commands.Cog):
             return web.Response(status=403, text='Verification failed')
 
     async def handle_messenger_webhook(self, request):
-        if request.path == '/messenger' and request.method == 'POST':
-            pass
-        else:
-            auth_key = request.headers.get('X-Auth-Key')
-            if not auth_key:
-                return self.json_response({'error': 'Missing X-Auth-Key'}, status=401)
-
         try:
             data = await request.json()
             self.logger.info(f"Received Messenger webhook data: {data}")
@@ -532,12 +520,196 @@ class ApiCog(commands.Cog):
             return self.json_response({'error': str(e)}, status=500)
 
     async def echo_to_discord(self, message):
-        channel_id = 981071936157286421
+        channel_id = int(os.getenv('MESSENGER_ECHO_CHANNEL_ID', 981071936157286421))
         channel = self.bot.get_channel(channel_id)
         if channel:
             await channel.send(message)
         else:
             self.logger.error(f"Could not find channel with ID {channel_id}")
+
+    # ------------------------------
+    # DATABASE MANAGEMENT
+    # ------------------------------
+    async def handle_get_databases(self, request):
+        db_cog = self.bot.get_cog('DatabaseCog')
+        if not db_cog:
+            return self.json_response({'error': 'Database module unavailable'}, status=503)
+        try:
+            include_deleted = request.query.get('include_deleted', 'false').lower() == 'true'
+            databases = await db_cog.fetch_all_databases(include_deleted=include_deleted)
+            return self.json_response(databases or [])
+        except Exception as e:
+            return self.json_response({'error': str(e)}, status=500)
+
+    async def handle_get_database(self, request):
+        db_cog = self.bot.get_cog('DatabaseCog')
+        if not db_cog:
+            return self.json_response({'error': 'Database module unavailable'}, status=503)
+        try:
+            uuid = request.match_info['uuid']
+            database = await db_cog.fetch_database(database_uuid=uuid)
+            if not database:
+                return self.json_response({'error': 'Database not found'}, status=404)
+            return self.json_response(database)
+        except Exception as e:
+            return self.json_response({'error': str(e)}, status=500)
+
+    async def handle_create_database(self, request):
+        db_cog = self.bot.get_cog('DatabaseCog')
+        if not db_cog:
+            return self.json_response({'error': 'Database module unavailable'}, status=503)
+        try:
+            data = await request.json()
+            database_type = data.get('database_type')
+            database_name = data.get('database_name')
+            allowed_hosts = data.get('allowed_hosts', 'localhost')
+            created_by = data.get('created_by')
+            if not all([database_type, database_name, created_by]):
+                return self.json_response({'error': 'Missing required fields: database_type, database_name, created_by'}, status=400)
+            success, result = await db_cog.create_actual_database(database_type, database_name, allowed_hosts, created_by)
+            if not success:
+                return self.json_response({'error': result}, status=500)
+            return self.json_response({'database_uuid': result}, status=201)
+        except Exception as e:
+            return self.json_response({'error': str(e)}, status=500)
+
+    async def handle_delete_database(self, request):
+        db_cog = self.bot.get_cog('DatabaseCog')
+        if not db_cog:
+            return self.json_response({'error': 'Database module unavailable'}, status=503)
+        try:
+            uuid = request.match_info['uuid']
+            data = await request.json()
+            database_name = data.get('database_name')
+            database_type = data.get('database_type')
+            deleted_by = data.get('deleted_by')
+            if not all([database_name, database_type, deleted_by]):
+                return self.json_response({'error': 'Missing required fields: database_name, database_type, deleted_by'}, status=400)
+            success, error = await db_cog.drop_actual_database(database_type, database_name, uuid, deleted_by)
+            if not success:
+                return self.json_response({'error': error}, status=500)
+            return self.json_response({'status': 'deleted'})
+        except Exception as e:
+            return self.json_response({'error': str(e)}, status=500)
+
+    async def handle_create_database_user(self, request):
+        db_cog = self.bot.get_cog('DatabaseCog')
+        if not db_cog:
+            return self.json_response({'error': 'Database module unavailable'}, status=503)
+        try:
+            data = await request.json()
+            database_type = data.get('database_type')
+            username = data.get('username')
+            password = data.get('password')
+            created_by = data.get('created_by')
+            if not all([database_type, username, password, created_by]):
+                return self.json_response({'error': 'Missing required fields: database_type, username, password, created_by'}, status=400)
+            success, result = await db_cog.create_actual_user(database_type, username, password, created_by)
+            if not success:
+                return self.json_response({'error': result}, status=500)
+            return self.json_response({'user_uuid': result}, status=201)
+        except Exception as e:
+            return self.json_response({'error': str(e)}, status=500)
+
+    async def handle_delete_database_user(self, request):
+        db_cog = self.bot.get_cog('DatabaseCog')
+        if not db_cog:
+            return self.json_response({'error': 'Database module unavailable'}, status=503)
+        try:
+            user_uuid = request.match_info['user_uuid']
+            data = await request.json()
+            database_type = data.get('database_type')
+            username = data.get('username')
+            deleted_by = data.get('deleted_by')
+            if not all([database_type, username, deleted_by]):
+                return self.json_response({'error': 'Missing required fields: database_type, username, deleted_by'}, status=400)
+            success, error = await db_cog.drop_actual_user(database_type, username, user_uuid, deleted_by)
+            if not success:
+                return self.json_response({'error': error}, status=500)
+            return self.json_response({'status': 'deleted'})
+        except Exception as e:
+            return self.json_response({'error': str(e)}, status=500)
+
+    async def handle_grant_privileges(self, request):
+        db_cog = self.bot.get_cog('DatabaseCog')
+        if not db_cog:
+            return self.json_response({'error': 'Database module unavailable'}, status=503)
+        try:
+            database_uuid = request.match_info['uuid']
+            data = await request.json()
+            database_type = data.get('database_type')
+            database_name = data.get('database_name')
+            user_uuid = data.get('user_uuid')
+            username = data.get('username')
+            privileges = data.get('privileges')
+            granted_by = data.get('granted_by')
+            if not all([database_type, database_name, user_uuid, username, privileges, granted_by]):
+                return self.json_response({'error': 'Missing required fields: database_type, database_name, user_uuid, username, privileges, granted_by'}, status=400)
+            success, error = await db_cog.grant_actual_privileges(database_type, database_name, database_uuid, username, user_uuid, privileges, granted_by)
+            if not success:
+                return self.json_response({'error': error}, status=500)
+            return self.json_response({'status': 'granted'})
+        except Exception as e:
+            return self.json_response({'error': str(e)}, status=500)
+
+    async def handle_revoke_privileges(self, request):
+        db_cog = self.bot.get_cog('DatabaseCog')
+        if not db_cog:
+            return self.json_response({'error': 'Database module unavailable'}, status=503)
+        try:
+            database_uuid = request.match_info['uuid']
+            user_uuid = request.match_info['user_uuid']
+            data = await request.json()
+            database_type = data.get('database_type')
+            database_name = data.get('database_name')
+            username = data.get('username')
+            revoked_by = data.get('revoked_by')
+            if not all([database_type, database_name, username, revoked_by]):
+                return self.json_response({'error': 'Missing required fields: database_type, database_name, username, revoked_by'}, status=400)
+            success, error = await db_cog.revoke_actual_privileges(database_type, database_name, database_uuid, username, user_uuid, revoked_by)
+            if not success:
+                return self.json_response({'error': error}, status=500)
+            return self.json_response({'status': 'revoked'})
+        except Exception as e:
+            return self.json_response({'error': str(e)}, status=500)
+
+    async def handle_perform_backup(self, request):
+        db_cog = self.bot.get_cog('DatabaseCog')
+        if not db_cog:
+            return self.json_response({'error': 'Database module unavailable'}, status=503)
+        try:
+            database_uuid = request.match_info['uuid']
+            data = await request.json()
+            database_type = data.get('database_type')
+            database_name = data.get('database_name')
+            if not all([database_type, database_name]):
+                return self.json_response({'error': 'Missing required fields: database_type, database_name'}, status=400)
+            success, result = await db_cog.perform_backup(database_uuid, database_type, database_name)
+            if not success:
+                return self.json_response({'error': result}, status=500)
+            return self.json_response({'backup_uuid': result}, status=201)
+        except Exception as e:
+            return self.json_response({'error': str(e)}, status=500)
+
+    async def handle_restore_backup(self, request):
+        db_cog = self.bot.get_cog('DatabaseCog')
+        if not db_cog:
+            return self.json_response({'error': 'Database module unavailable'}, status=503)
+        try:
+            database_uuid = request.match_info['uuid']
+            data = await request.json()
+            database_type = data.get('database_type')
+            database_name = data.get('database_name')
+            backup_file_path = data.get('backup_file_path')
+            if not all([database_type, database_name, backup_file_path]):
+                return self.json_response({'error': 'Missing required fields: database_type, database_name, backup_file_path'}, status=400)
+            success, error = await db_cog.restore_backup(database_type, database_name, backup_file_path)
+            if not success:
+                return self.json_response({'error': error}, status=500)
+            return self.json_response({'status': 'restored'})
+        except Exception as e:
+            return self.json_response({'error': str(e)}, status=500)
+
 
 def setup(bot):
     bot.add_cog(ApiCog(bot))
