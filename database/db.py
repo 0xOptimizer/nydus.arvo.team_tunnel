@@ -54,13 +54,16 @@ async def execute_query(query, params=(), fetch_one=False, fetch_all=False):
         async with DB_POOL.acquire() as conn:
             async with conn.cursor(aiomysql.DictCursor) as cursor:
                 await cursor.execute(query, params)
-                
+
                 if fetch_one:
                     return await cursor.fetchone()
                 if fetch_all:
                     return await cursor.fetchall()
-                return cursor.lastrowid
-                
+
+                if cursor.lastrowid:
+                    return cursor.lastrowid
+                return cursor.rowcount
+
     except aiomysql.Error as e:
         logger.error(f"Database Query Error: {e} | Query: {query}")
         return None
