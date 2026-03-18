@@ -80,12 +80,16 @@ class ApiCog(commands.Cog):
         self._add_route('GET', '/api/databases/{uuid}', self.handle_get_database)
         self._add_route('POST', '/api/databases', self.handle_create_database)
         self._add_route('DELETE', '/api/databases/{uuid}', self.handle_delete_database)
+        self._add_route('GET', '/api/databases/users', self.handle_get_database_users)
         self._add_route('POST', '/api/databases/users', self.handle_create_database_user)
         self._add_route('DELETE', '/api/databases/users/{user_uuid}', self.handle_delete_database_user)
         self._add_route('POST', '/api/databases/{uuid}/privileges', self.handle_grant_privileges)
         self._add_route('DELETE', '/api/databases/{uuid}/privileges/{user_uuid}', self.handle_revoke_privileges)
         self._add_route('POST', '/api/databases/{uuid}/backup', self.handle_perform_backup)
         self._add_route('POST', '/api/databases/{uuid}/restore', self.handle_restore_backup)
+        self._add_route('GET', '/api/databases/{uuid}/privileges', self.handle_get_database_privileges)
+        self._add_route('GET', '/api/databases/privileges', self.handle_get_all_privileges)
+        self._add_route('GET', '/api/databases/users/{user_uuid}/credentials', self.handle_get_user_credentials)
 
     # ------------------------------
     # INTERNAL SERVER
@@ -707,6 +711,52 @@ class ApiCog(commands.Cog):
             if not success:
                 return self.json_response({'error': error}, status=500)
             return self.json_response({'status': 'restored'})
+        except Exception as e:
+            return self.json_response({'error': str(e)}, status=500)
+
+
+    async def handle_get_database_users(self, request):
+        db_cog = self.bot.get_cog('DatabaseCog')
+        if not db_cog:
+            return self.json_response({'error': 'Database module unavailable'}, status=503)
+        try:
+            include_deleted = request.query.get('include_deleted', 'false').lower() == 'true'
+            users = await db_cog.fetch_all_database_users(include_deleted=include_deleted)
+            return self.json_response(users or [])
+        except Exception as e:
+            return self.json_response({'error': str(e)}, status=500)
+
+    async def handle_get_database_privileges(self, request):
+        db_cog = self.bot.get_cog('DatabaseCog')
+        if not db_cog:
+            return self.json_response({'error': 'Database module unavailable'}, status=503)
+        try:
+            uuid = request.match_info['uuid']
+            privileges = await db_cog.fetch_privileges_for_database(uuid)
+            return self.json_response(privileges or [])
+        except Exception as e:
+            return self.json_response({'error': str(e)}, status=500)
+
+    async def handle_get_all_privileges(self, request):
+        db_cog = self.bot.get_cog('DatabaseCog')
+        if not db_cog:
+            return self.json_response({'error': 'Database module unavailable'}, status=503)
+        try:
+            privileges = await db_cog.fetch_all_privileges()
+            return self.json_response(privileges or [])
+        except Exception as e:
+            return self.json_response({'error': str(e)}, status=500)
+
+    async def handle_get_user_credentials(self, request):
+        db_cog = self.bot.get_cog('DatabaseCog')
+        if not db_cog:
+            return self.json_response({'error': 'Database module unavailable'}, status=503)
+        try:
+            user_uuid = request.match_info['user_uuid']
+            credentials = await db_cog.get_user_credentials(user_uuid)
+            if not credentials:
+                return self.json_response({'error': 'User not found or decryption failed'}, status=404)
+            return self.json_response(credentials)
         except Exception as e:
             return self.json_response({'error': str(e)}, status=500)
 

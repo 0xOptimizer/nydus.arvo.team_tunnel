@@ -14,6 +14,10 @@ from database.db import (
     update_backup_status,
     get_database,
     get_all_databases,
+    get_database_user,
+    get_all_database_users,
+    get_database_privileges,
+    get_active_privileges_for_database,
     create_database as db_create_database,
     delete_database as db_delete_database,
     create_database_user as db_create_database_user,
@@ -271,6 +275,24 @@ class DatabaseCog(commands.Cog):
 
     async def fetch_database(self, database_uuid: str = None, database_name: str = None) -> Optional[dict]:
         return await get_database(database_uuid=database_uuid, database_name=database_name)
+
+    async def fetch_all_database_users(self, include_deleted: bool = False) -> Optional[list]:
+        return await get_all_database_users(include_deleted=include_deleted)
+
+    async def fetch_privileges_for_database(self, database_uuid: str) -> Optional[list]:
+        return await get_active_privileges_for_database(database_uuid)
+
+    async def fetch_all_privileges(self) -> Optional[list]:
+        return await get_database_privileges()
+
+    async def get_user_credentials(self, user_uuid: str) -> Optional[dict]:
+        user = await get_database_user(user_uuid=user_uuid)
+        if not user:
+            return None
+        decrypted = self._decrypt_password(user['password_encrypted'])
+        if decrypted is None:
+            return None
+        return {'username': user['username'], 'password': decrypted}
 
     # ------------------------------------------------------------------
     # Engine operations (coordinated with db.py recording)
