@@ -4,6 +4,7 @@ from aiohttp import web
 import os
 import hmac
 import hashlib
+import secrets
 import json
 import logging
 import asyncio
@@ -90,6 +91,7 @@ class ApiCog(commands.Cog):
         self._add_route('GET', '/api/databases/{uuid}/privileges', self.handle_get_database_privileges)
         self._add_route('GET', '/api/databases/privileges', self.handle_get_all_privileges)
         self._add_route('GET', '/api/databases/users/{user_uuid}/credentials', self.handle_get_user_credentials)
+        self._add_route('POST', '/api/databases/pma-token', self.handle_pma_token)
 
     # ------------------------------
     # INTERNAL SERVER
@@ -757,6 +759,27 @@ class ApiCog(commands.Cog):
             if not credentials:
                 return self.json_response({'error': 'User not found or decryption failed'}, status=404)
             return self.json_response(credentials)
+        except Exception as e:
+            return self.json_response({'error': str(e)}, status=500)
+
+    async def handle_pma_token(self, request):
+        db_cog = self.bot.get_cog('DatabaseCog')
+        if not db_cog:
+            return self.json_response({'error': 'Database module unavailable'}, status=503)
+        try:
+            data = await request.json()
+            user_uuid = data.get('user_uuid')
+            if not user_uuid:
+                return self.json_response({'error': 'Missing user_uuid'}, status=400)
+            credentials = await db_cog.get_user_credentials(user_uuid)
+            if not credentials:
+                return self.json_response({'error': 'User not found or decryption failed'}, status=404)
+            token = secrets.token_hex(32)
+            credentials_path = f'/tmp/nydus_pma_{token}.json'
+            with open(credentials_path, 'w') as f:
+                json.dump(credentials, f)
+            os.chmod(credentials_path, 0o600)
+            return self.json_response({'token': token})
         except Exception as e:
             return self.json_response({'error': str(e)}, status=500)
 
