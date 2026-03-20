@@ -8,6 +8,7 @@ class ElectionTokenCog(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
         self.main_pool = None
+        self.dev_id = int(os.environ.get("DEV_ID", 0))
         self._lock = asyncio.Lock()
         self.issued_ids = {}
 
@@ -113,7 +114,7 @@ class ElectionTokenCog(commands.Cog):
     async def flush_tokens(self, ctx):
         if not await self.check_dev(ctx):
             return
-            
+
         async with self._lock:
             self.issued_ids.clear()
         await ctx.respond("Issued tokens tracking has been reset.", ephemeral=True)
