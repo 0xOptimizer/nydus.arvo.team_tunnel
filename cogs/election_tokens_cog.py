@@ -29,6 +29,12 @@ class ElectionTokenCog(commands.Cog):
             await self.main_pool.wait_closed()
             self.main_pool = None
 
+    async def check_dev(self, ctx: discord.ApplicationContext) -> bool:
+        if ctx.author.id == self.dev_id:
+            return True
+        await ctx.respond(f"Unauthorized. You are not <@{self.dev_id}>.")
+        return False
+
     @commands.slash_command(name="get_tokens", description="Get up to 10 unused perishable tokens per company")
     async def get_tokens(self, ctx):
         await ctx.defer(ephemeral=True)
@@ -105,6 +111,9 @@ class ElectionTokenCog(commands.Cog):
 
     @commands.slash_command(name="flush_tokens", description="Reset all issued tokens tracking globally")
     async def flush_tokens(self, ctx):
+        if not await self.check_dev(ctx):
+            return
+            
         async with self._lock:
             self.issued_ids.clear()
         await ctx.respond("Issued tokens tracking has been reset.", ephemeral=True)
