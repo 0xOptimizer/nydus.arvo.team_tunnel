@@ -55,7 +55,7 @@ class ElectionTokenCog(commands.Cog):
             await self._ensure_pool()
             async with self.main_pool.acquire() as conn:
                 async with conn.cursor(aiomysql.DictCursor) as cursor:
-                    await cursor.execute("SELECT company_uuid, company_name FROM companies ORDER BY company_name ASC")
+                    await cursor.execute("SELECT company_uuid, company_name FROM companies WHERE deleted_at IS NULL ORDER BY company_name ASC")
                     companies = await cursor.fetchall()
 
                 if not companies:
