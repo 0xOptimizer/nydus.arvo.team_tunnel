@@ -4,7 +4,7 @@ import aiomysql
 import discord
 from discord.ext import commands
 
-class TokenCog(commands.Cog):
+class ElectionTokenCog(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
         self.main_pool = None
@@ -44,17 +44,17 @@ class TokenCog(commands.Cog):
             await ctx.respond(f"An error occurred: {e}")
 
     async def _fetch_tokens(self, limit: int):
-        """Core logic: fetch tokens not yet issued, record them, return otp_codes."""
-        async with self._lock:   # ensure no two commands interfere
+        if self.main_pool is None:
+            raise RuntimeError("Database pool is not initialized.")
+        async with self._lock:
             async with self.main_pool.acquire() as conn:
-                # Build the NOT IN clause if we have issued IDs
                 if self.issued_ids:
                     placeholders = ','.join(['%s'] * len(self.issued_ids))
                     query = f"""
                         SELECT id, otp_code FROM tokens
                         WHERE is_used = 0 AND is_perishable = 1
-                          AND (expires_at IS NULL OR expires_at > NOW())
-                          AND id NOT IN ({placeholders})
+                        AND (expires_at IS NULL OR expires_at > NOW())
+                        AND id NOT IN ({placeholders})
                         ORDER BY created_at ASC
                         LIMIT %s
                     """
@@ -63,7 +63,7 @@ class TokenCog(commands.Cog):
                     query = """
                         SELECT id, otp_code FROM tokens
                         WHERE is_used = 0 AND is_perishable = 1
-                          AND (expires_at IS NULL OR expires_at > NOW())
+                        AND (expires_at IS NULL OR expires_at > NOW())
                         ORDER BY created_at ASC
                         LIMIT %s
                     """
@@ -73,14 +73,12 @@ class TokenCog(commands.Cog):
                     await cursor.execute(query, params)
                     rows = await cursor.fetchall()
 
-                if not rows:
-                    return []
+            if not rows:
+                return []
 
-                # Add the selected token IDs to the issued set
-                new_ids = {row['id'] for row in rows}
-                self.issued_ids.update(new_ids)
-
-                return [row['otp_code'] for row in rows]
+            new_ids = {row['id'] for row in rows}
+            self.issued_ids.update(new_ids)
+            return [row['otp_code'] for row in rows]
 
     @commands.slash_command(name="flush_tokens", description="Reset the issued tokens tracking")
     async def flush_tokens(self, ctx):
@@ -89,4 +87,4 @@ class TokenCog(commands.Cog):
         await ctx.respond("Issued tokens tracking has been reset.", ephemeral=True)
 
 def setup(bot):
-    bot.add_cog(TokenCog(bot))
+    bot.add_cog(ElectionTokenCog(bot))
