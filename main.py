@@ -43,7 +43,7 @@ async def main():
     
     for cog in cogs_list:
         try:
-            await bot.load_extension(cog)
+            bot.load_extension(cog)
         except Exception as e:
             logging.error(f"Failed to load cog {cog}: {e}")
     
