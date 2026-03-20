@@ -36,7 +36,7 @@ class ElectionTokenCog(commands.Cog):
         await ctx.respond(f"Unauthorized. You are not <@{self.dev_id}>.")
         return False
 
-    @commands.slash_command(name="get_tokens", description="Get up to 10 unused perishable tokens per company")
+    @commands.slash_command(name="get_tokens", description="Get up to 10 unused perishable tokens per company", guild_ids=[1443171332501278744, 981071935716876298])
     async def get_tokens(self, ctx):
         await ctx.defer(ephemeral=True)
         try:
@@ -110,7 +110,7 @@ class ElectionTokenCog(commands.Cog):
 
                 return results
 
-    @commands.slash_command(name="flush_tokens", description="Reset all issued tokens tracking globally")
+    @commands.slash_command(name="flush_tokens", description="Reset all issued tokens tracking globally", guild_ids=[1443171332501278744, 981071935716876298])
     async def flush_tokens(self, ctx):
         if not await self.check_dev(ctx):
             return
