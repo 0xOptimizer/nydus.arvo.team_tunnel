@@ -31,15 +31,15 @@ class ElectionTokenCog(commands.Cog):
 
     @commands.slash_command(name="get_tokens", description="Get up to 10 unused perishable tokens")
     async def get_tokens(self, ctx):
-        await ctx.defer()
+        await ctx.defer(ephemeral=True)
         try:
             tokens = await self._fetch_tokens(limit=10)
             if not tokens:
-                await ctx.respond("No tokens available right now.", ephemeral=True)
+                await ctx.respond("No tokens available right now.")
                 return
 
             token_list = "\n".join(f"`{t}`" for t in tokens)
-            await ctx.respond(f"{token_list}", ephemeral=True)
+            await ctx.respond(f"{token_list}")
         except Exception as e:
             await ctx.respond(f"An error occurred: {e}")
 
