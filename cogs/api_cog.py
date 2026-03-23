@@ -778,7 +778,7 @@ class ApiCog(commands.Cog):
             credentials_path = f'/tmp/nydus_pma_{token}.json'
             with open(credentials_path, 'w') as f:
                 json.dump(credentials, f)
-            os.chmod(credentials_path, 0o600)
+            os.chmod(credentials_path, 0o644)
             return self.json_response({'token': token})
         except Exception as e:
             return self.json_response({'error': str(e)}, status=500)
