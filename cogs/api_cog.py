@@ -92,6 +92,7 @@ class ApiCog(commands.Cog):
         self._add_route('GET', '/api/databases/privileges', self.handle_get_all_privileges)
         self._add_route('GET', '/api/databases/users/{user_uuid}/credentials', self.handle_get_user_credentials)
         self._add_route('POST', '/api/databases/pma-token', self.handle_pma_token)
+        self._add_route('POST', '/api/databases/quickgen', self.handle_db_quickgen)
 
     # ------------------------------
     # INTERNAL SERVER
@@ -780,6 +781,19 @@ class ApiCog(commands.Cog):
                 json.dump(credentials, f)
             os.chmod(credentials_path, 0o644)
             return self.json_response({'token': token})
+        except Exception as e:
+            return self.json_response({'error': str(e)}, status=500)
+
+    async def handle_db_quickgen(self, request):
+        db_cog = self.bot.get_cog('DatabaseCog')
+        if not db_cog:
+            return self.json_response({'error': 'Database module unavailable'}, status=503)
+        try:
+            data = await request.json()
+            database_type = data.get('database_type')
+            created_by = data.get('created_by')
+            quickgen = await db_cog.quickgen_provision(database_type=database_type, created_by=created_by)
+            return self.json_response(quickgen or [])
         except Exception as e:
             return self.json_response({'error': str(e)}, status=500)
 

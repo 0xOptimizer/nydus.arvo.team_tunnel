@@ -5,6 +5,8 @@ from abc import ABC, abstractmethod
 from datetime import datetime
 from typing import Optional, Tuple, Dict, List
 
+import random
+import secrets
 from cryptography.fernet import Fernet, InvalidToken
 from discord.ext import commands
 
@@ -28,6 +30,22 @@ from database.db import (
 
 logger = logging.getLogger('nydus.database')
 
+_STARCRAFT_LOCATIONS = [
+    "aiur", "char", "korhal", "tarsonis", "mar_sara", "antiga", "braxis",
+    "shakuras", "moria", "umoja", "castanar", "dylar", "metis", "torus",
+    "meinhoff", "agria", "tyrador", "kaldir", "zerus", "ulnar", "revanscar",
+    "bel_shir", "skygeirr", "deadwing", "monlyth", "valhalla", "haven",
+    "avernus", "stronar", "jarban", "turaxis", "choss", "artika", "pridewater"
+]
+
+_TOUHOU_CHARACTERS = [
+    "reimu", "marisa", "sakuya", "remilia", "flandre", "youmu", "yuyuko",
+    "yukari", "suika", "reisen", "eirin", "kaguya", "mokou", "sanae",
+    "cirno", "meiling", "patchouli", "alice", "nitori", "aya", "momiji",
+    "tenshi", "iku", "komachi", "satori", "koishi", "okuu", "orin",
+    "nazrin", "shou", "byakuren", "kogasa", "ichirin", "murasa", "nue",
+    "tewi", "keine", "mystia", "yuuka", "rumia", "wriggle", "chen", "ran"
+]
 
 # ------------------------------------------------------------------
 # Abstract Base Class for Database Backends
@@ -397,6 +415,55 @@ class DatabaseCog(commands.Cog):
         if not os.path.exists(backup_file_path):
             return False, "Backup file not found"
         return await backend.restore(database_name, backup_file_path)
+
+    async def _generate_quickgen_names(self) -> tuple[str, str]:
+        existing = await get_all_databases(include_deleted=False) or []
+        existing_names = {db['database_name'] for db in existing}
+
+        for _ in range(20):
+            location = random.choice(_STARCRAFT_LOCATIONS)
+            hex_suffix = secrets.token_hex(4)
+            db_name = f"{location}_{hex_suffix}"
+            if db_name not in existing_names:
+                touhou = random.choice(_TOUHOU_CHARACTERS)
+                username = f"{touhou}_{db_name}"
+                return db_name, username
+
+        raise RuntimeError("Failed to generate a unique database name after 20 attempts.")
+
+    async def quickgen_provision(self, database_type: str, created_by: str) -> tuple[bool, str, dict]:
+        db_name, username = await self._generate_quickgen_names()
+        password = secrets.token_urlsafe(24)
+
+        ok, result = await self.create_actual_database(database_type, db_name, '*', created_by)
+        if not ok:
+            return False, result, {}
+
+        database_uuid = result
+
+        ok, result = await self.create_actual_user(database_type, username, password, created_by)
+        if not ok:
+            await self.drop_actual_database(database_type, db_name, database_uuid, created_by)
+            return False, result, {}
+
+        user_uuid = result
+
+        ok, error = await self.grant_actual_privileges(
+            database_type, db_name, database_uuid,
+            username, user_uuid, 'ALL PRIVILEGES', created_by
+        )
+        if not ok:
+            await self.drop_actual_user(database_type, username, user_uuid, created_by)
+            await self.drop_actual_database(database_type, db_name, database_uuid, created_by)
+            return False, error, {}
+
+        return True, "", {
+            "database_uuid": database_uuid,
+            "database_name": db_name,
+            "user_uuid": user_uuid,
+            "username": username,
+            "password": password,
+        }
 
 
 def setup(bot):
