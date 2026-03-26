@@ -788,12 +788,26 @@ class ApiCog(commands.Cog):
         db_cog = self.bot.get_cog('DatabaseCog')
         if not db_cog:
             return self.json_response({'error': 'Database module unavailable'}, status=503)
+
         try:
             data = await request.json()
             database_type = data.get('database_type')
             created_by = data.get('created_by')
-            quickgen = await db_cog.quickgen_provision(database_type=database_type, created_by=created_by)
-            return self.json_response(quickgen or [])
+
+            # Validate required fields
+            if not database_type or not created_by:
+                return self.json_response({'error': 'Missing database_type or created_by'}, status=400)
+
+            success, error, result = await db_cog.quickgen_provision(
+                database_type=database_type,
+                created_by=created_by
+            )
+
+            if success:
+                return self.json_response(result)   # ← returns the credentials dict
+            else:
+                return self.json_response({'error': error}, status=500)
+
         except Exception as e:
             return self.json_response({'error': str(e)}, status=500)
 
