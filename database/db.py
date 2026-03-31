@@ -668,3 +668,17 @@ async def delete_backups_for_database(database_uuid: str, deleted_by: str = None
         params = (database_uuid,)
     result = await execute_query(query, params)
     return bool(result)
+
+async def get_backups_for_database(database_uuid: str) -> Optional[list]:
+    return await execute_query(
+        "SELECT * FROM database_backups WHERE target_database_uuid = %s ORDER BY created_at DESC",
+        (database_uuid,),
+        fetch='all'
+    )
+
+async def get_backup_by_uuid(backup_uuid: str) -> Optional[dict]:
+    return await execute_query(
+        "SELECT * FROM database_backups WHERE backup_uuid = %s",
+        (backup_uuid,),
+        fetch='one'
+    )

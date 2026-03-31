@@ -93,6 +93,8 @@ class ApiCog(commands.Cog):
         self._add_route('GET', '/api/databases/users/{user_uuid}/credentials', self.handle_get_user_credentials)
         self._add_route('POST', '/api/databases/pma-token', self.handle_pma_token)
         self._add_route('POST', '/api/databases/quickgen', self.handle_db_quickgen)
+        self._add_route('GET', '/api/databases/backups/{backup_uuid}/download', self.handle_download_backup)
+        self._add_route('GET', '/api/databases/{uuid}/backups', self.handle_get_database_backups)
 
     # ------------------------------
     # INTERNAL SERVER
@@ -808,6 +810,52 @@ class ApiCog(commands.Cog):
             else:
                 return self.json_response({'error': error}, status=500)
 
+        except Exception as e:
+            return self.json_response({'error': str(e)}, status=500)
+
+    async def handle_get_database_backups(self, request):
+        db_cog = self.bot.get_cog('DatabaseCog')
+        if not db_cog:
+            return self.json_response({'error': 'Database module unavailable'}, status=503)
+        try:
+            database_uuid = request.match_info['uuid']
+            backups = await db_cog.fetch_backups_for_database(database_uuid)
+            return self.json_response(backups or [])
+        except Exception as e:
+            return self.json_response({'error': str(e)}, status=500)
+
+    async def handle_download_backup(self, request):
+        db_cog = self.bot.get_cog('DatabaseCog')
+        if not db_cog:
+            return self.json_response({'error': 'Database module unavailable'}, status=503)
+        try:
+            backup_uuid = request.match_info['backup_uuid']
+            backup = await db_cog.fetch_backup(backup_uuid)
+            if not backup:
+                return self.json_response({'error': 'Backup not found'}, status=404)
+            file_path = backup.get('file_path', '')
+            if not os.path.exists(file_path):
+                return self.json_response({'error': 'Backup file not found on disk'}, status=404)
+            filename = backup.get('file_name', os.path.basename(file_path))
+            content_type = 'application/gzip' if filename.endswith('.gz') else 'application/octet-stream'
+            file_size = os.path.getsize(file_path)
+            response = web.StreamResponse(
+                status=200,
+                headers={
+                    'Content-Disposition': f'attachment; filename="{filename}"',
+                    'Content-Type': content_type,
+                    'Content-Length': str(file_size),
+                    'Access-Control-Allow-Origin': '*',
+                }
+            )
+            await response.prepare(request)
+            with open(file_path, 'rb') as f:
+                while True:
+                    chunk = f.read(65536)
+                    if not chunk:
+                        break
+                    await response.write(chunk)
+            return response
         except Exception as e:
             return self.json_response({'error': str(e)}, status=500)
 
