@@ -7,6 +7,7 @@ import logging
 from dotenv import load_dotenv
 import hmac
 from datetime import datetime, timezone
+from typing import Optional
 
 load_dotenv()
 
