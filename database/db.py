@@ -683,3 +683,145 @@ async def get_backup_by_uuid(backup_uuid: str) -> Optional[dict]:
         (backup_uuid,),
         fetch_one=True
     )
+
+async def create_database_schedule_records(database_uuid: str, database_name: str, database_type: str) -> bool:
+    config = _json.dumps({'database_uuid': database_uuid, 'database_name': database_name, 'database_type': database_type})
+    validity_uuid = str(_uuid.uuid4())
+    next_validity = datetime.utcnow() + timedelta(hours=12)
+    records = [
+        (validity_uuid, database_uuid, f"{database_name}_validity", 'db_validity_check', 'validity', 43200, 1, next_validity, config),
+        (str(_uuid.uuid4()), database_uuid, f"{database_name}_week1", 'db_backup', 'week1', 21600, 0, None, config),
+        (str(_uuid.uuid4()), database_uuid, f"{database_name}_week1_plus", 'db_backup', 'week1_plus', 86400, 0, None, config),
+        (str(_uuid.uuid4()), database_uuid, f"{database_name}_month1_plus", 'db_backup', 'month1_plus', 259200, 0, None, config),
+        (str(_uuid.uuid4()), database_uuid, f"{database_name}_month3_plus", 'db_backup', 'month3_plus', 604800, 0, None, config),
+    ]
+    for r in records:
+        result = await execute_query(
+            "INSERT INTO database_schedules (schedule_uuid, database_uuid, name, task_type, phase, interval_seconds, enabled, next_run_at, task_config) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)",
+            r
+        )
+        if result is None:
+            return False
+    await execute_query(
+        "INSERT IGNORE INTO database_schedule_stats (stat_uuid, database_uuid) VALUES (%s, %s)",
+        (str(_uuid.uuid4()), database_uuid)
+    )
+    return True
+
+async def get_due_schedules(limit: int = 50) -> Optional[list]:
+    return await execute_query(
+        "SELECT * FROM database_schedules WHERE enabled = 1 AND next_run_at <= UTC_TIMESTAMP() ORDER BY next_run_at ASC LIMIT %s",
+        (limit,),
+        fetch_all=True
+    )
+
+async def get_schedules_for_database(database_uuid: str) -> Optional[list]:
+    return await execute_query(
+        "SELECT * FROM database_schedules WHERE database_uuid = %s ORDER BY created_at ASC",
+        (database_uuid,),
+        fetch_all=True
+    )
+
+async def get_schedule_by_uuid(schedule_uuid: str) -> Optional[dict]:
+    return await execute_query(
+        "SELECT * FROM database_schedules WHERE schedule_uuid = %s",
+        (schedule_uuid,),
+        fetch_one=True
+    )
+
+async def set_schedule_next_run(schedule_uuid: str, next_run_at) -> None:
+    await execute_query(
+        "UPDATE database_schedules SET next_run_at = %s WHERE schedule_uuid = %s",
+        (next_run_at, schedule_uuid)
+    )
+
+async def set_schedule_enabled(schedule_uuid: str, enabled: int) -> None:
+    await execute_query(
+        "UPDATE database_schedules SET enabled = %s WHERE schedule_uuid = %s",
+        (enabled, schedule_uuid)
+    )
+
+async def set_schedule_interval(schedule_uuid: str, interval_seconds: int) -> None:
+    await execute_query(
+        "UPDATE database_schedules SET interval_seconds = %s WHERE schedule_uuid = %s",
+        (interval_seconds, schedule_uuid)
+    )
+
+async def get_schedule_for_database_phase(database_uuid: str, phase: str) -> Optional[dict]:
+    return await execute_query(
+        "SELECT * FROM database_schedules WHERE database_uuid = %s AND phase = %s",
+        (database_uuid, phase),
+        fetch_one=True
+    )
+
+async def get_enabled_backup_schedules_with_db_age() -> Optional[list]:
+    return await execute_query(
+        "SELECT ds.*, d.created_at as db_created_at FROM database_schedules ds JOIN databases d ON ds.database_uuid = d.database_uuid WHERE ds.enabled = 1 AND ds.task_type = 'db_backup'",
+        fetch_all=True
+    )
+
+async def transition_schedule_phase(old_uuid: str, new_uuid: str, interval_seconds: int, next_run_at) -> None:
+    await execute_query("UPDATE database_schedules SET enabled = 0 WHERE schedule_uuid = %s", (old_uuid,))
+    await execute_query(
+        "UPDATE database_schedules SET enabled = 1, interval_seconds = %s, next_run_at = %s WHERE schedule_uuid = %s",
+        (interval_seconds, next_run_at, new_uuid)
+    )
+
+async def create_schedule_log(schedule_uuid: Optional[str], database_uuid: str, event_type: str,
+                               old_interval: Optional[int] = None, new_interval: Optional[int] = None,
+                               message: Optional[str] = None) -> None:
+    await execute_query(
+        "INSERT INTO database_schedule_logs (log_uuid, schedule_uuid, database_uuid, event_type, old_interval_seconds, new_interval_seconds, message) VALUES (%s, %s, %s, %s, %s, %s, %s)",
+        (str(_uuid.uuid4()), schedule_uuid, database_uuid, event_type, old_interval, new_interval, message)
+    )
+
+async def upsert_schedule_stats(database_uuid: str, success: bool, file_size_bytes: int, duration_ms: int) -> None:
+    if success:
+        await execute_query(
+            """INSERT INTO database_schedule_stats (stat_uuid, database_uuid, total_backups, successful_backups, total_backup_size_bytes, average_backup_size_bytes, last_backup_at, last_successful_backup_at, last_duration_ms, average_duration_ms)
+               VALUES (UUID(), %s, 1, 1, %s, %s, UTC_TIMESTAMP(), UTC_TIMESTAMP(), %s, %s)
+               ON DUPLICATE KEY UPDATE
+                 total_backups = total_backups + 1,
+                 successful_backups = successful_backups + 1,
+                 total_backup_size_bytes = total_backup_size_bytes + %s,
+                 average_backup_size_bytes = (total_backup_size_bytes + %s) / (successful_backups + 1),
+                 last_backup_at = UTC_TIMESTAMP(),
+                 last_successful_backup_at = UTC_TIMESTAMP(),
+                 last_duration_ms = %s,
+                 average_duration_ms = (average_duration_ms * successful_backups + %s) / (successful_backups + 1)""",
+            (database_uuid, file_size_bytes, file_size_bytes, duration_ms, duration_ms,
+             file_size_bytes, file_size_bytes, duration_ms, duration_ms)
+        )
+    else:
+        await execute_query(
+            """INSERT INTO database_schedule_stats (stat_uuid, database_uuid, total_backups, failed_backups, last_backup_at, last_failed_backup_at)
+               VALUES (UUID(), %s, 1, 1, UTC_TIMESTAMP(), UTC_TIMESTAMP())
+               ON DUPLICATE KEY UPDATE
+                 total_backups = total_backups + 1,
+                 failed_backups = failed_backups + 1,
+                 last_backup_at = UTC_TIMESTAMP(),
+                 last_failed_backup_at = UTC_TIMESTAMP()""",
+            (database_uuid,)
+        )
+
+async def get_schedule_stats(database_uuid: str) -> Optional[dict]:
+    return await execute_query(
+        "SELECT * FROM database_schedule_stats WHERE database_uuid = %s",
+        (database_uuid,),
+        fetch_one=True
+    )
+
+async def check_database_has_data(database_name: str) -> Optional[dict]:
+    return await execute_query(
+        "SELECT COUNT(*) as table_count, COALESCE(SUM(TABLE_ROWS), 0) as total_rows FROM information_schema.TABLES WHERE table_schema = %s",
+        (database_name,),
+        fetch_one=True
+    )
+
+async def get_database_size_bytes(database_name: str) -> int:
+    row = await execute_query(
+        "SELECT COALESCE(SUM(data_length + index_length), 0) as total_bytes FROM information_schema.TABLES WHERE table_schema = %s",
+        (database_name,),
+        fetch_one=True
+    )
+    return int(row['total_bytes']) if row else 0

@@ -340,6 +340,9 @@ class DatabaseCog(commands.Cog):
         if not record:
             logger.error(f"Database `{database_name}` created on server but metadata record failed.")
             return False, "Database created but failed to record metadata."
+        schedule_cog = self.bot.get_cog('DatabaseScheduleCog')
+        if schedule_cog:
+            await schedule_cog.initialise_schedule_records(record['database_uuid'], database_name, database_type)
         return True, record['database_uuid']
 
     async def drop_actual_database(self, database_type: str, database_name: str,
@@ -649,8 +652,7 @@ class DatabaseCog(commands.Cog):
         for b in backups[:15]:
             size = b.get('file_size_bytes')
             size_str = f"{size / 1024 / 1024:.2f} MB" if size else "N/A"
-            short_uuid = b['backup_uuid'][:8]
-            lines.append(f"`{short_uuid}...` — {b['status']} — {size_str} — {b.get('created_at', '')}")
+            lines.append(f"`{b['backup_uuid']}...` — {b['status']} — {size_str} — {b.get('created_at', '')}")
 
         total = len(backups)
         shown = min(total, 15)
