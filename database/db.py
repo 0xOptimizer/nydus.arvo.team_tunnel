@@ -684,10 +684,10 @@ async def create_database_schedule_records(database_uuid: str, database_name: st
     next_validity = datetime.utcnow() + timedelta(hours=12)
     records = [
         (validity_uuid, database_uuid, f"{database_name}_validity", 'db_validity_check', 'validity', 43200, 1, next_validity, config),
-        (str(_uuid.uuid4()), database_uuid, f"{database_name}_week1", 'db_backup', 'week1', 21600, 0, None, config),
-        (str(_uuid.uuid4()), database_uuid, f"{database_name}_week1_plus", 'db_backup', 'week1_plus', 86400, 0, None, config),
-        (str(_uuid.uuid4()), database_uuid, f"{database_name}_month1_plus", 'db_backup', 'month1_plus', 259200, 0, None, config),
-        (str(_uuid.uuid4()), database_uuid, f"{database_name}_month3_plus", 'db_backup', 'month3_plus', 604800, 0, None, config),
+        (str(uuid.uuid4()), database_uuid, f"{database_name}_week1", 'db_backup', 'week1', 21600, 0, None, config),
+        (str(uuid.uuid4()), database_uuid, f"{database_name}_week1_plus", 'db_backup', 'week1_plus', 86400, 0, None, config),
+        (str(uuid.uuid4()), database_uuid, f"{database_name}_month1_plus", 'db_backup', 'month1_plus', 259200, 0, None, config),
+        (str(uuid.uuid4()), database_uuid, f"{database_name}_month3_plus", 'db_backup', 'month3_plus', 604800, 0, None, config),
     ]
     for r in records:
         result = await execute_query(
@@ -698,7 +698,7 @@ async def create_database_schedule_records(database_uuid: str, database_name: st
             return False
     await execute_query(
         "INSERT IGNORE INTO database_schedule_stats (stat_uuid, database_uuid) VALUES (%s, %s)",
-        (str(_uuid.uuid4()), database_uuid)
+        (str(uuid.uuid4()), database_uuid)
     )
     return True
 
@@ -770,7 +770,7 @@ async def create_schedule_log(schedule_uuid: Optional[str], database_uuid: str, 
                                message: Optional[str] = None) -> None:
     await execute_query(
         "INSERT INTO database_schedule_logs (log_uuid, schedule_uuid, database_uuid, event_type, old_interval_seconds, new_interval_seconds, message) VALUES (%s, %s, %s, %s, %s, %s, %s)",
-        (str(_uuid.uuid4()), schedule_uuid, database_uuid, event_type, old_interval, new_interval, message)
+        (str(uuid.uuid4()), schedule_uuid, database_uuid, event_type, old_interval, new_interval, message)
     )
 
 async def upsert_schedule_stats(database_uuid: str, success: bool, file_size_bytes: int, duration_ms: int) -> None:
