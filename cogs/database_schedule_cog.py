@@ -48,6 +48,60 @@ _SIZE_THRESHOLD_BYTES = 50 * 1024 * 1024
 _DISPATCHER_INTERVAL = 60
 _SCHEDULE_BATCH_SIZE = 50
 
+class _ProvisionConfirmView(discord.ui.View):
+    def __init__(self, cog: 'DatabaseScheduleCog', databases: list):
+        super().__init__(timeout=60)
+        self._cog = cog
+        self._databases = databases
+        self._triggered = False
+
+    @discord.ui.button(label="Provision All", style=discord.ButtonStyle.success)
+    async def confirm(self, button: discord.ui.Button, interaction: discord.Interaction):
+        if self._triggered:
+            await interaction.response.send_message("Already running.", ephemeral=True)
+            return
+        self._triggered = True
+        self.disable_all_items()
+        await interaction.response.edit_message(
+            content=f"Provisioning schedules for {len(self._databases)} database(s)...",
+            embed=None,
+            view=self
+        )
+
+        succeeded = []
+        failed = []
+        for db in self._databases:
+            try:
+                await self._cog.initialise_schedule_records(
+                    db['database_uuid'],
+                    db['database_name'],
+                    db['database_type']
+                )
+                succeeded.append(db['database_name'])
+            except Exception as e:
+                failed.append((db['database_name'], str(e)))
+                logger.error(f"Failed to provision schedule for {db['database_name']}: {e}")
+
+        lines = []
+        for name in succeeded:
+            lines.append(f"✓ `{name}`")
+        for name, err in failed:
+            lines.append(f"✗ `{name}` — {err}")
+
+        embed = discord.Embed(
+            title=f"Provisioning Complete ({len(succeeded)} succeeded, {len(failed)} failed)",
+            description="\n".join(lines) or "Nothing to report.",
+            color=discord.Color.green() if not failed else discord.Color.orange()
+        )
+        await interaction.edit_original_response(content=None, embed=embed, view=None)
+
+    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
+    async def cancel(self, button: discord.ui.Button, interaction: discord.Interaction):
+        self.disable_all_items()
+        await interaction.response.edit_message(content="Cancelled.", embed=None, view=None)
+
+    async def on_timeout(self):
+        self.disable_all_items()
 
 class DatabaseScheduleCog(commands.Cog):
 
@@ -276,62 +330,6 @@ class DatabaseScheduleCog(commands.Cog):
 
         except Exception as e:
             logger.error(f"Backup error for schedule {schedule_uuid}: {e}")
-
-    class _ProvisionConfirmView(discord.ui.View):
-
-        def __init__(self, cog: 'DatabaseScheduleCog', databases: list):
-            super().__init__(timeout=60)
-            self._cog = cog
-            self._databases = databases
-            self._triggered = False
-
-        @discord.ui.button(label="Provision All", style=discord.ButtonStyle.success)
-        async def confirm(self, button: discord.ui.Button, interaction: discord.Interaction):
-            if self._triggered:
-                await interaction.response.send_message("Already running.", ephemeral=True)
-                return
-            self._triggered = True
-            self.disable_all_items()
-            await interaction.response.edit_message(
-                content=f"Provisioning schedules for {len(self._databases)} database(s)...",
-                embed=None,
-                view=self
-            )
-
-            succeeded = []
-            failed = []
-            for db in self._databases:
-                try:
-                    await self._cog.initialise_schedule_records(
-                        db['database_uuid'],
-                        db['database_name'],
-                        db['database_type']
-                    )
-                    succeeded.append(db['database_name'])
-                except Exception as e:
-                    failed.append((db['database_name'], str(e)))
-                    logger.error(f"Failed to provision schedule for {db['database_name']}: {e}")
-
-            lines = []
-            for name in succeeded:
-                lines.append(f"✓ `{name}`")
-            for name, err in failed:
-                lines.append(f"✗ `{name}` — {err}")
-
-            embed = discord.Embed(
-                title=f"Provisioning Complete ({len(succeeded)} succeeded, {len(failed)} failed)",
-                description="\n".join(lines) or "Nothing to report.",
-                color=discord.Color.green() if not failed else discord.Color.orange()
-            )
-            await interaction.edit_original_response(content=None, embed=embed, view=None)
-
-        @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
-        async def cancel(self, button: discord.ui.Button, interaction: discord.Interaction):
-            self.disable_all_items()
-            await interaction.response.edit_message(content="Cancelled.", embed=None, view=None)
-
-        async def on_timeout(self):
-            self.disable_all_items()
 
     @schedule_group.command(name="list", description="List schedules for a database")
     async def cmd_schedule_list(
