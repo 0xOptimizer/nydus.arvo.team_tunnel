@@ -13,7 +13,9 @@ from datetime import datetime
 from database.db import (
     get_recent_system_resources_with_averages, get_webhook_project_by_uuid, get_all_webhook_projects, create_new_webhook_project,
     delete_webhook_project, add_github_project, get_all_github_projects, get_all_attached_projects,
-    remove_github_project, get_user, get_auth_key, validate_auth_key, execute_query
+    remove_github_project, get_user, get_auth_key, validate_auth_key, execute_query,
+    get_all_recent_backups,
+    get_all_schedules, get_schedule_by_uuid, set_schedule_enabled, set_schedule_next_run, create_schedule_log
 )
 
 def json_serial(obj):
@@ -77,6 +79,10 @@ class ApiCog(commands.Cog):
         self._add_route('POST', '/api/messenger', self.handle_messenger_webhook)
 
         # Database management routes
+        self._add_route('GET', '/api/databases/backups', self.handle_get_all_backups)
+        self._add_route('GET', '/api/databases/schedules', self.handle_get_all_schedules)
+        self._add_route('POST', '/api/databases/schedules/{schedule_uuid}/toggle', self.handle_toggle_schedule)
+        self._add_route('POST', '/api/databases/schedules/{schedule_uuid}/run', self.handle_force_run_schedule)
         self._add_route('GET', '/api/databases', self.handle_get_databases)
         self._add_route('GET', '/api/databases/{uuid}', self.handle_get_database)
         self._add_route('POST', '/api/databases', self.handle_create_database)
@@ -856,6 +862,63 @@ class ApiCog(commands.Cog):
                         break
                     await response.write(chunk)
             return response
+        except Exception as e:
+            return self.json_response({'error': str(e)}, status=500)
+
+    async def handle_get_all_backups(self, request):
+        try:
+            limit = int(request.query.get('limit', 50))
+            backups = await get_all_recent_backups(limit)
+            return self.json_response(backups or [])
+        except Exception as e:
+            return self.json_response({'error': str(e)}, status=500)
+
+    async def handle_get_all_schedules(self, request):
+        try:
+            schedules = await get_all_schedules()
+            return self.json_response(schedules or [])
+        except Exception as e:
+            return self.json_response({'error': str(e)}, status=500)
+
+    async def handle_toggle_schedule(self, request):
+        schedule_cog = self.bot.get_cog('DatabaseScheduleCog')
+        if not schedule_cog:
+            return self.json_response({'error': 'Schedule module unavailable'}, status=503)
+        try:
+            schedule_uuid = request.match_info['schedule_uuid']
+            s = await get_schedule_by_uuid(schedule_uuid)
+            if not s:
+                return self.json_response({'error': 'Schedule not found'}, status=404)
+            new_state = 0 if s['enabled'] else 1
+            await set_schedule_enabled(schedule_uuid, new_state)
+            if new_state == 1 and not s['next_run_at']:
+                await set_schedule_next_run(schedule_uuid, datetime.utcnow() + timedelta(seconds=s['interval_seconds']))
+            await create_schedule_log(
+                schedule_uuid=schedule_uuid,
+                database_uuid=s['database_uuid'],
+                event_type='manual_toggle',
+                message=f"Schedule {'enabled' if new_state else 'disabled'} via API"
+            )
+            return self.json_response({'enabled': bool(new_state)})
+        except Exception as e:
+            return self.json_response({'error': str(e)}, status=500)
+
+    async def handle_force_run_schedule(self, request):
+        schedule_cog = self.bot.get_cog('DatabaseScheduleCog')
+        if not schedule_cog:
+            return self.json_response({'error': 'Schedule module unavailable'}, status=503)
+        try:
+            schedule_uuid = request.match_info['schedule_uuid']
+            s = await get_schedule_by_uuid(schedule_uuid)
+            if not s:
+                return self.json_response({'error': 'Schedule not found'}, status=404)
+            if s['task_type'] == 'db_validity_check':
+                asyncio.create_task(schedule_cog._guarded_validity_check(s))
+            elif s['task_type'] == 'db_backup':
+                asyncio.create_task(schedule_cog._guarded_backup(s))
+            else:
+                return self.json_response({'error': f"Unknown task type: {s['task_type']}"}, status=400)
+            return self.json_response({'status': 'queued'})
         except Exception as e:
             return self.json_response({'error': str(e)}, status=500)
 

@@ -835,3 +835,21 @@ async def get_databases_without_schedules() -> Optional[list]:
         (),
         fetch_all=True
     )
+
+async def get_all_recent_backups(limit: int = 50) -> Optional[list]:
+    return await execute_query(
+        "SELECT b.*, d.database_name FROM database_backups b "
+        "JOIN database_creations d ON b.target_database_uuid = d.database_uuid "
+        "WHERE b.deleted_at IS NULL ORDER BY b.created_at DESC LIMIT %s",
+        (limit,),
+        fetch_all=True
+    )
+
+async def get_all_schedules() -> Optional[list]:
+    return await execute_query(
+        "SELECT ds.*, d.database_name FROM database_schedules ds "
+        "JOIN database_creations d ON ds.database_uuid = d.database_uuid "
+        "WHERE d.deleted_at IS NULL ORDER BY d.database_name ASC, ds.created_at ASC",
+        (),
+        fetch_all=True
+    )
