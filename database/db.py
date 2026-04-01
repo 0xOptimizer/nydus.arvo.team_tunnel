@@ -6,7 +6,8 @@ import string
 import logging
 from dotenv import load_dotenv
 import hmac
-from datetime import datetime, timezone
+import json
+from datetime import datetime, timezone, timedelta
 from typing import Optional
 
 load_dotenv()
@@ -670,13 +671,6 @@ async def delete_backups_for_database(database_uuid: str, deleted_by: str = None
     result = await execute_query(query, params)
     return bool(result)
 
-async def get_backups_for_database(database_uuid: str) -> Optional[list]:
-    return await execute_query(
-        "SELECT * FROM database_backups WHERE target_database_uuid = %s ORDER BY created_at DESC",
-        (database_uuid,),
-        fetch_all=True
-    )
-
 async def get_backup_by_uuid(backup_uuid: str) -> Optional[dict]:
     return await execute_query(
         "SELECT * FROM database_backups WHERE backup_uuid = %s",
@@ -685,8 +679,8 @@ async def get_backup_by_uuid(backup_uuid: str) -> Optional[dict]:
     )
 
 async def create_database_schedule_records(database_uuid: str, database_name: str, database_type: str) -> bool:
-    config = _json.dumps({'database_uuid': database_uuid, 'database_name': database_name, 'database_type': database_type})
-    validity_uuid = str(_uuid.uuid4())
+    config = json.dumps({'database_uuid': database_uuid, 'database_name': database_name, 'database_type': database_type})
+    validity_uuid = str(uuid.uuid4())
     next_validity = datetime.utcnow() + timedelta(hours=12)
     records = [
         (validity_uuid, database_uuid, f"{database_name}_validity", 'db_validity_check', 'validity', 43200, 1, next_validity, config),
@@ -758,9 +752,9 @@ async def get_enabled_backup_schedules_with_db_age() -> Optional[list]:
     return await execute_query(
         "SELECT ds.*, d.created_at as db_created_at "
         "FROM database_schedules ds "
-        "JOIN databases d ON ds.database_uuid = d.database_uuid "
+        "JOIN database_creations d ON ds.database_uuid = d.database_uuid "
         "WHERE ds.enabled = 1 AND ds.task_type = 'db_backup'",
-        None,
+        (),
         fetch_all=True
     )
 
@@ -832,11 +826,12 @@ async def get_database_size_bytes(database_name: str) -> int:
 
 async def get_databases_without_schedules() -> Optional[list]:
     return await execute_query(
-        """SELECT d.* FROM databases d
+        """SELECT d.* FROM database_creations d
            WHERE d.deleted_at IS NULL
            AND NOT EXISTS (
                SELECT 1 FROM database_schedules ds
                WHERE ds.database_uuid = d.database_uuid
            )""",
+        (),
         fetch_all=True
     )
