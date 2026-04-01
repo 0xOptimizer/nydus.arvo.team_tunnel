@@ -825,3 +825,14 @@ async def get_database_size_bytes(database_name: str) -> int:
         fetch_one=True
     )
     return int(row['total_bytes']) if row else 0
+
+async def get_databases_without_schedules() -> Optional[list]:
+    return await execute_query(
+        """SELECT d.* FROM databases d
+           WHERE d.deleted_at IS NULL
+           AND NOT EXISTS (
+               SELECT 1 FROM database_schedules ds
+               WHERE ds.database_uuid = d.database_uuid
+           )""",
+        fetch_all=True
+    )

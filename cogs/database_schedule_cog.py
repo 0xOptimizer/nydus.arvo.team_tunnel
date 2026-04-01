@@ -25,6 +25,7 @@ from database.db import (
     get_schedule_stats,
     check_database_has_data,
     get_database_size_bytes,
+    get_databases_without_schedules
 )
 
 logger = logging.getLogger('nydus.database_schedule')
@@ -276,6 +277,62 @@ class DatabaseScheduleCog(commands.Cog):
         except Exception as e:
             logger.error(f"Backup error for schedule {schedule_uuid}: {e}")
 
+    class _ProvisionConfirmView(discord.ui.View):
+
+        def __init__(self, cog: 'DatabaseScheduleCog', databases: list):
+            super().__init__(timeout=60)
+            self._cog = cog
+            self._databases = databases
+            self._triggered = False
+
+        @discord.ui.button(label="Provision All", style=discord.ButtonStyle.success)
+        async def confirm(self, button: discord.ui.Button, interaction: discord.Interaction):
+            if self._triggered:
+                await interaction.response.send_message("Already running.", ephemeral=True)
+                return
+            self._triggered = True
+            self.disable_all_items()
+            await interaction.response.edit_message(
+                content=f"Provisioning schedules for {len(self._databases)} database(s)...",
+                embed=None,
+                view=self
+            )
+
+            succeeded = []
+            failed = []
+            for db in self._databases:
+                try:
+                    await self._cog.initialise_schedule_records(
+                        db['database_uuid'],
+                        db['database_name'],
+                        db['database_type']
+                    )
+                    succeeded.append(db['database_name'])
+                except Exception as e:
+                    failed.append((db['database_name'], str(e)))
+                    logger.error(f"Failed to provision schedule for {db['database_name']}: {e}")
+
+            lines = []
+            for name in succeeded:
+                lines.append(f"✓ `{name}`")
+            for name, err in failed:
+                lines.append(f"✗ `{name}` — {err}")
+
+            embed = discord.Embed(
+                title=f"Provisioning Complete ({len(succeeded)} succeeded, {len(failed)} failed)",
+                description="\n".join(lines) or "Nothing to report.",
+                color=discord.Color.green() if not failed else discord.Color.orange()
+            )
+            await interaction.edit_original_response(content=None, embed=embed, view=None)
+
+        @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
+        async def cancel(self, button: discord.ui.Button, interaction: discord.Interaction):
+            self.disable_all_items()
+            await interaction.response.edit_message(content="Cancelled.", embed=None, view=None)
+
+        async def on_timeout(self):
+            self.disable_all_items()
+
     @schedule_group.command(name="list", description="List schedules for a database")
     async def cmd_schedule_list(
         self,
@@ -405,6 +462,38 @@ class DatabaseScheduleCog(commands.Cog):
             f"Schedule `{schedule_uuid[:8]}...` queued for immediate run. It will respect the semaphore.",
             ephemeral=True
         )
+
+    @schedule_group.command(name="audit", description="Find databases missing schedule records and optionally provision them")
+    async def cmd_schedule_audit(self, ctx: discord.ApplicationContext):
+        if not self._check_dev(ctx):
+            await ctx.respond("Unauthorized.", ephemeral=True)
+            return
+
+        await ctx.defer(ephemeral=True)
+        databases = await get_databases_without_schedules()
+
+        if not databases:
+            await ctx.followup.send("All databases have schedule records. Nothing to provision.", ephemeral=True)
+            return
+
+        lines = []
+        for db in databases[:25]:
+            lines.append(f"`{db['database_name']}` — {db['database_type']} — `{db['database_uuid'][:8]}...`")
+
+        overflow = len(databases) - 25
+        description = "\n".join(lines)
+        if overflow > 0:
+            description += f"\n... and {overflow} more"
+
+        embed = discord.Embed(
+            title=f"{len(databases)} database(s) missing schedules",
+            description=description,
+            color=discord.Color.orange()
+        )
+        embed.set_footer(text="Provisioning will create 5 schedule records per database. Validity checks will be enabled immediately.")
+
+        view = _ProvisionConfirmView(self, databases)
+        await ctx.followup.send(embed=embed, view=view, ephemeral=True)
 
 
 def setup(bot):
