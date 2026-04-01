@@ -756,7 +756,11 @@ async def get_schedule_for_database_phase(database_uuid: str, phase: str) -> Opt
 
 async def get_enabled_backup_schedules_with_db_age() -> Optional[list]:
     return await execute_query(
-        "SELECT ds.*, d.created_at as db_created_at FROM database_schedules ds JOIN databases d ON ds.database_uuid = d.database_uuid WHERE ds.enabled = 1 AND ds.task_type = 'db_backup'",
+        "SELECT ds.*, d.created_at as db_created_at "
+        "FROM database_schedules ds "
+        "JOIN databases d ON ds.database_uuid = d.database_uuid "
+        "WHERE ds.enabled = 1 AND ds.task_type = 'db_backup'",
+        None,
         fetch_all=True
     )
 
