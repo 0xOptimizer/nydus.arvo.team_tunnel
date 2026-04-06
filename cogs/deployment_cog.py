@@ -202,6 +202,39 @@ class DeploymentCog(commands.Cog):
         # Output will be empty if branch not found
         return bool(out.strip())
 
+    async def get_default_branch(self, git_url: str, pat: str = "") -> str | None:
+        """Detect the default branch of the remote repository."""
+        # Build authenticated URL if PAT is provided
+        if pat and git_url.startswith('https://'):
+            git_url = git_url.replace('https://', f'https://{pat}@')
+        
+        # Use git ls-remote to get the default branch
+        # Output format: "ref: refs/heads/main\tHEAD" or "ref: refs/heads/master\tHEAD"
+        cmd = ['git', 'ls-remote', '--symref', git_url, 'HEAD']
+        code, out, _ = await self.run_exec(cmd, timeout=30)
+        
+        if code != 0 or not out.strip():
+            return None
+        
+        # Parse the output to extract branch name
+        # Format: ref: refs/heads/BRANCH_NAME\tHEAD
+        for line in out.strip().split('\n'):
+            if line.startswith('ref:'):
+                # Extract branch name from "ref: refs/heads/branch_name"
+                parts = line.split('refs/heads/')
+                if len(parts) > 1:
+                    branch = parts[1].split('\t')[0].strip()
+                    return branch if branch else None
+        return None
+
+    async def get_local_git_remote_url(self, cwd: str) -> str | None:
+        """Get the remote URL from a local git repository."""
+        cmd = ['git', 'config', '--get', 'remote.origin.url']
+        code, out, _ = await self.run_exec(cmd, cwd=cwd, timeout=10)
+        if code == 0:
+            return out.strip()
+        return None
+
     def _get_project_lock(self, project_uuid: str) -> asyncio.Lock:
         if project_uuid not in self._project_locks:
             self._project_locks[project_uuid] = asyncio.Lock()
@@ -397,8 +430,15 @@ class DeploymentCog(commands.Cog):
         await emit(f"[GIT] Checking if branch '{branch}' exists in remote...")
         branch_valid = await self.branch_exists(git_url, branch, pat)
         if not branch_valid:
-            await emit(f"[FAIL] Branch '{branch}' does not exist in the repository.")
-            raise DeployError(f"Branch '{branch}' not found.")
+            await emit(f"[GIT] Branch '{branch}' not found. Attempting to detect repository default branch...")
+            detected_branch = await self.get_default_branch(git_url, pat)
+            if detected_branch:
+                await emit(f"[GIT] Detected default branch: '{detected_branch}'")
+                branch = detected_branch
+                branch_valid = True
+            else:
+                await emit(f"[FAIL] Could not find branch '{branch}' or detect repository default branch.")
+                raise DeployError(f"Branch '{branch}' not found and could not detect default.")
         await emit("[GIT] Branch exists.")
 
         fqdn         = f"{subdomain}.{_DOMAIN}"
@@ -1374,6 +1414,24 @@ class DeploymentCog(commands.Cog):
                 lock = self._get_project_lock(deployment['project_uuid'])
                 async with lock:
                     await emit(f"[REBUILD] Starting rebuild for {deployment_uuid[:8]}...")
+
+                    # Try to detect the correct branch if the stored one doesn't exist
+                    await emit(f"[REBUILD] Verifying branch '{branch}' exists...")
+                    git_url = await self.get_local_git_remote_url(deploy_path)
+                    if git_url:
+                        branch_valid = await self.branch_exists(git_url, branch)
+                        if not branch_valid:
+                            await emit(f"[REBUILD] Branch '{branch}' not found. Detecting default branch...")
+                            detected_branch = await self.get_default_branch(git_url)
+                            if detected_branch:
+                                await emit(f"[REBUILD] Using detected default branch: '{detected_branch}'")
+                                branch = detected_branch
+                            else:
+                                await emit(f"[REBUILD] Could not detect default branch, will attempt with '{branch}' anyway.")
+                        else:
+                            await emit(f"[REBUILD] Branch '{branch}' verified.")
+                    else:
+                        await emit(f"[REBUILD] Could not get remote URL, proceeding with branch '{branch}'")
 
                     await emit("[REBUILD] Fetching latest code from git...")
                     for step in [
