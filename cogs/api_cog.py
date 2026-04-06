@@ -15,7 +15,8 @@ from database.db import (
     delete_webhook_project, add_github_project, get_all_github_projects, get_all_attached_projects,
     remove_github_project, get_user, get_auth_key, validate_auth_key, execute_query,
     get_all_recent_backups,
-    get_all_schedules, get_schedule_by_uuid, set_schedule_enabled, set_schedule_next_run, create_schedule_log
+    get_all_schedules, get_schedule_by_uuid, set_schedule_enabled, set_schedule_next_run, create_schedule_log,
+    get_all_deployments, get_deployment_by_uuid, update_deployment,
 )
 
 def json_serial(obj):
@@ -101,6 +102,18 @@ class ApiCog(commands.Cog):
         self._add_route('POST', '/api/databases/quickgen', self.handle_db_quickgen)
         self._add_route('GET', '/api/databases/backups/{backup_uuid}/download', self.handle_download_backup)
         self._add_route('GET', '/api/databases/{uuid}/backups', self.handle_get_database_backups)
+
+        # Deployments
+        self._add_route('GET', '/api/deployments', self.handle_list_deployments)
+        self._add_route('GET', '/api/deployments/{deployment_uuid}', self.handle_get_deployment)
+        self._add_route('POST', '/api/deploy', self.handle_deploy)
+        self._add_route('GET', '/api/deploy/logs/{run_uuid}', self.handle_stream_logs)
+        self._add_route('POST', '/api/deploy/rebuild/{deployment_uuid}', self.handle_rebuild)
+        self._add_route('DELETE', '/api/deployments/{deployment_uuid}', self.handle_delete_deployment)
+        self._add_route('GET', '/api/deployments/{deployment_uuid}/env', self.handle_get_env)
+        self._add_route('PUT', '/api/deployments/{deployment_uuid}/env', self.handle_update_env)
+        self._add_route('POST', '/api/deployments/{deployment_uuid}/env', self.handle_add_env)
+        self._add_route('DELETE', '/api/deployments/{deployment_uuid}/env', self.handle_delete_env)
 
     # ------------------------------
     # INTERNAL SERVER
@@ -919,6 +932,188 @@ class ApiCog(commands.Cog):
             else:
                 return self.json_response({'error': f"Unknown task type: {s['task_type']}"}, status=400)
             return self.json_response({'status': 'queued'})
+        except Exception as e:
+            return self.json_response({'error': str(e)}, status=500)
+
+    async def handle_list_deployments(self, request):
+        """GET /api/deployments"""
+        dep_cog = self.bot.get_cog('DeploymentCog')
+        if not dep_cog:
+            return self.json_response({'error': 'Deployment module unavailable'}, status=503)
+        from database.db import get_all_deployments
+        deployments = await get_all_deployments()
+        return self.json_response(deployments)
+
+    async def handle_get_deployment(self, request):
+        """GET /api/deployments/{deployment_uuid}"""
+        dep_cog = self.bot.get_cog('DeploymentCog')
+        if not dep_cog:
+            return self.json_response({'error': 'Deployment module unavailable'}, status=503)
+        deployment_uuid = request.match_info['deployment_uuid']
+        deployment = await get_deployment_by_uuid(deployment_uuid)
+        if not deployment:
+            return self.json_response({'error': 'Deployment not found'}, status=404)
+        return self.json_response(deployment)
+
+    async def handle_deploy(self, request):
+        """POST /api/deploy  body: {project_uuid, subdomain, github_pat}"""
+        dep_cog = self.bot.get_cog('DeploymentCog')
+        if not dep_cog:
+            return self.json_response({'error': 'Deployment module unavailable'}, status=503)
+        try:
+            data = await request.json()
+            project_uuid = data.get('project_uuid')
+            subdomain = data.get('subdomain')
+            github_pat = data.get('github_pat')
+            if not all([project_uuid, subdomain, github_pat]):
+                return self.json_response({'error': 'Missing project_uuid, subdomain, or github_pat'}, status=400)
+            # Fetch project data (you need a get_project_by_uuid function)
+            from database.db import get_github_project_by_uuid
+            project = await get_github_project_by_uuid(project_uuid)
+            if not project:
+                return self.json_response({'error': 'Project not found'}, status=404)
+            # Map project fields to what DeploymentCog expects
+            project_data = {
+                'project_uuid': project['project_uuid'],
+                'name': project['name'],
+                'git_url': project['git_url'],
+                'default_branch': project.get('branch', 'main')
+            }
+            triggered_by = request.get('auth_key_data', {}).get('owner_discord_id', 'api')
+            run_id = dep_cog.queue_deploy(project_data, subdomain, github_pat, triggered_by)
+            return self.json_response({'run_id': run_id}, status=202)
+        except Exception as e:
+            return self.json_response({'error': str(e)}, status=500)
+
+    async def handle_stream_logs(self, request):
+        """GET /api/deploy/logs/{run_uuid}  - Server-Sent Events stream"""
+        dep_cog = self.bot.get_cog('DeploymentCog')
+        if not dep_cog:
+            return self.json_response({'error': 'Deployment module unavailable'}, status=503)
+        run_uuid = request.match_info['run_uuid']
+        queue = dep_cog.get_stream(run_uuid)
+        if not queue:
+            return self.json_response({'error': 'No active log stream for that run ID'}, status=404)
+        response = web.StreamResponse(
+            status=200,
+            headers={
+                'Content-Type': 'text/event-stream',
+                'Cache-Control': 'no-cache',
+                'Connection': 'keep-alive',
+                'Access-Control-Allow-Origin': '*'
+            }
+        )
+        await response.prepare(request)
+        try:
+            while True:
+                line = await asyncio.wait_for(queue.get(), timeout=30.0)
+                if line is None:
+                    break
+                await response.write(f"data: {json.dumps({'line': line})}\n\n".encode())
+                await response.drain()
+        except asyncio.TimeoutError:
+            await response.write(f"data: {json.dumps({'error': 'Stream timeout'})}\n\n".encode())
+        except ConnectionResetError:
+            pass
+        return response
+
+    async def handle_rebuild(self, request):
+        """POST /api/deploy/rebuild/{deployment_uuid}"""
+        dep_cog = self.bot.get_cog('DeploymentCog')
+        if not dep_cog:
+            return self.json_response({'error': 'Deployment module unavailable'}, status=503)
+        deployment_uuid = request.match_info['deployment_uuid']
+        deployment = await get_deployment_by_uuid(deployment_uuid)
+        if not deployment:
+            return self.json_response({'error': 'Deployment not found'}, status=404)
+        triggered_by = request.get('auth_key_data', {}).get('owner_discord_id', 'api')
+        run_id = dep_cog.queue_rebuild(deployment_uuid, triggered_by)
+        return self.json_response({'run_id': run_id}, status=202)
+
+    async def handle_delete_deployment(self, request):
+        """DELETE /api/deployments/{deployment_uuid}"""
+        dep_cog = self.bot.get_cog('DeploymentCog')
+        if not dep_cog:
+            return self.json_response({'error': 'Deployment module unavailable'}, status=503)
+        deployment_uuid = request.match_info['deployment_uuid']
+        success, msg = await dep_cog.delete_deployment(deployment_uuid)
+        if not success:
+            return self.json_response({'error': msg}, status=400)
+        return self.json_response({'status': 'deleted', 'message': msg})
+
+    async def handle_get_env(self, request):
+        """GET /api/deployments/{deployment_uuid}/env
+        Returns list of {key, value} for the deployment's env file.
+        """
+        dep_cog = self.bot.get_cog('DeploymentCog')
+        if not dep_cog:
+            return self.json_response({'error': 'Deployment module unavailable'}, status=503)
+        deployment_uuid = request.match_info['deployment_uuid']
+        env_vars, error = await dep_cog.get_env_lines(deployment_uuid)
+        if error:
+            return self.json_response({'error': error}, status=404)
+        return self.json_response({'env': env_vars})
+
+    async def handle_update_env(self, request):
+        """PUT /api/deployments/{deployment_uuid}/env
+        Body: {"key": "VAR_NAME", "value": "new_value"}
+        Updates an existing environment variable.
+        """
+        dep_cog = self.bot.get_cog('DeploymentCog')
+        if not dep_cog:
+            return self.json_response({'error': 'Deployment module unavailable'}, status=503)
+        try:
+            data = await request.json()
+            key = data.get('key')
+            value = data.get('value')
+            if not key or value is None:
+                return self.json_response({'error': 'Missing key or value'}, status=400)
+            deployment_uuid = request.match_info['deployment_uuid']
+            success, error = await dep_cog.update_env_line(deployment_uuid, key, value)
+            if not success:
+                return self.json_response({'error': error}, status=400)
+            return self.json_response({'status': 'updated', 'key': key})
+        except Exception as e:
+            return self.json_response({'error': str(e)}, status=500)
+
+    async def handle_add_env(self, request):
+        """POST /api/deployments/{deployment_uuid}/env
+        Body: {"key": "NEW_VAR", "value": "some_value"}
+        Adds a new environment variable (fails if key already exists).
+        """
+        dep_cog = self.bot.get_cog('DeploymentCog')
+        if not dep_cog:
+            return self.json_response({'error': 'Deployment module unavailable'}, status=503)
+        try:
+            data = await request.json()
+            key = data.get('key')
+            value = data.get('value')
+            if not key or value is None:
+                return self.json_response({'error': 'Missing key or value'}, status=400)
+            deployment_uuid = request.match_info['deployment_uuid']
+            success, error = await dep_cog.add_env_line(deployment_uuid, key, value)
+            if not success:
+                return self.json_response({'error': error}, status=400)
+            return self.json_response({'status': 'added', 'key': key})
+        except Exception as e:
+            return self.json_response({'error': str(e)}, status=500)
+
+    async def handle_delete_env(self, request):
+        """DELETE /api/deployments/{deployment_uuid}/env?key=VAR_NAME
+        Deletes an environment variable by key.
+        """
+        dep_cog = self.bot.get_cog('DeploymentCog')
+        if not dep_cog:
+            return self.json_response({'error': 'Deployment module unavailable'}, status=503)
+        try:
+            key = request.query.get('key')
+            if not key:
+                return self.json_response({'error': 'Missing key query parameter'}, status=400)
+            deployment_uuid = request.match_info['deployment_uuid']
+            success, error = await dep_cog.delete_env_line(deployment_uuid, key)
+            if not success:
+                return self.json_response({'error': error}, status=400)
+            return self.json_response({'status': 'deleted', 'key': key})
         except Exception as e:
             return self.json_response({'error': str(e)}, status=500)
 

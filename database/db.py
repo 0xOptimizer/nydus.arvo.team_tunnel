@@ -895,12 +895,12 @@ async def create_deployment_log(
         logger.error(f"Failed to create deployment log for run {run_uuid}")
 
 
-async def get_deployment_by_subdomain(subdomain: str) -> Optional[Dict[str, Any]]:
+async def get_deployment_by_subdomain(subdomain: str) -> Optional[dict[str, Any]]:
     query = "SELECT * FROM deployments WHERE subdomain = %s"
     return await execute_query(query, (subdomain,), fetch_one=True)
 
 
-async def get_deployment_by_uuid(deployment_uuid: str) -> Optional[Dict[str, Any]]:
+async def get_deployment_by_uuid(deployment_uuid: str) -> Optional[dict[str, Any]]:
     query = "SELECT * FROM deployments WHERE deployment_uuid = %s"
     return await execute_query(query, (deployment_uuid,), fetch_one=True)
 
@@ -940,3 +940,23 @@ async def update_deployment_log(
     params = (status, output_log, run_uuid)
     result = await execute_query(query, params)
     return result is not None and result >= 0
+
+async def get_all_deployments(project_uuid: str = None, status: str = None) -> list:
+    query = "SELECT * FROM deployments"
+    conditions = []
+    params = []
+    if project_uuid:
+        conditions.append("project_uuid = %s")
+        params.append(project_uuid)
+    if status:
+        conditions.append("status = %s")
+        params.append(status)
+    if conditions:
+        query += " WHERE " + " AND ".join(conditions)
+    query += " ORDER BY deployed_at DESC"
+    result = await execute_query(query, params, fetch_all=True)
+    return result or []
+
+async def get_github_project_by_uuid(project_uuid: str):
+    query = "SELECT * FROM projects WHERE project_uuid = %s"
+    return await execute_query(query, (project_uuid,), fetch_one=True)
