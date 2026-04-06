@@ -895,12 +895,12 @@ async def create_deployment_log(
         logger.error(f"Failed to create deployment log for run {run_uuid}")
 
 
-async def get_deployment_by_subdomain(subdomain: str) -> Optional[dict[str, Any]]:
+async def get_deployment_by_subdomain(subdomain: str) -> Optional[dict[str, any]]:
     query = "SELECT * FROM deployments WHERE subdomain = %s"
     return await execute_query(query, (subdomain,), fetch_one=True)
 
 
-async def get_deployment_by_uuid(deployment_uuid: str) -> Optional[dict[str, Any]]:
+async def get_deployment_by_uuid(deployment_uuid: str) -> Optional[dict[str, any]]:
     query = "SELECT * FROM deployments WHERE deployment_uuid = %s"
     return await execute_query(query, (deployment_uuid,), fetch_one=True)
 
