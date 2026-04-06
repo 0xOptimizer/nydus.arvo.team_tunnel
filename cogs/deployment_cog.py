@@ -6,6 +6,7 @@ import shutil
 import uuid as uuid_lib
 from datetime import datetime, timezone
 
+import aiohttp
 import discord
 from discord.ext import commands
 
@@ -186,6 +187,21 @@ class DeploymentCog(commands.Cog):
         self._project_locks: dict[str, asyncio.Lock] = {}
         self._active_streams: dict[str, asyncio.Queue] = {}
 
+    async def branch_exists(self, git_url: str, branch: str, pat: str = "") -> bool:
+        """Check if a branch exists in the remote repository."""
+        # Build authenticated URL if PAT is provided
+        if pat and git_url.startswith('https://'):
+            git_url = git_url.replace('https://', f'https://{pat}@')
+        
+        # Use git ls-remote to check branch
+        cmd = ['git', 'ls-remote', '--heads', git_url, branch]
+        code, out, _ = await self.run_exec(cmd, timeout=30)
+        
+        if code != 0:
+            return False
+        # Output will be empty if branch not found
+        return bool(out.strip())
+
     def _get_project_lock(self, project_uuid: str) -> asyncio.Lock:
         if project_uuid not in self._project_locks:
             self._project_locks[project_uuid] = asyncio.Lock()
@@ -210,29 +226,58 @@ class DeploymentCog(commands.Cog):
                 cwd=cwd,
                 env=env,
             )
-            loop = asyncio.get_running_loop()
+            
             stdout_lines = []
             stderr_lines = []
-            async def read_stream(stream, lines_list, name):
-                while True:
-                    line = await stream.readline()
-                    if not line:
-                        break
-                    decoded = line.decode(errors='replace').rstrip()
-                    lines_list.append(decoded)
-                    yield decoded
+            output_queue = asyncio.Queue()
+            
+            async def read_stream(stream, lines_list):
+                """Read from a stream and put lines in queue."""
+                try:
+                    while True:
+                        line = await stream.readline()
+                        if not line:
+                            break
+                        decoded = line.decode(errors='replace').rstrip()
+                        lines_list.append(decoded)
+                        await output_queue.put((None, decoded))
+                except asyncio.CancelledError:
+                    pass
+            
             try:
                 async with asyncio.timeout(timeout):
-                    async for line in read_stream(process.stdout, stdout_lines, 'stdout'):
-                        yield (None, line)
-                    async for line in read_stream(process.stderr, stderr_lines, 'stderr'):
-                        yield (None, line)
-                    await process.wait()
+                    # Start concurrent readers for both stdout and stderr
+                    stdout_task = asyncio.create_task(read_stream(process.stdout, stdout_lines))
+                    stderr_task = asyncio.create_task(read_stream(process.stderr, stderr_lines))
+                    
+                    # Start a task to wait for process completion
+                    process_task = asyncio.create_task(process.wait())
+                    
+                    # Yield all queued output lines
+                    while not process_task.done() or not output_queue.empty():
+                        try:
+                            item = await asyncio.wait_for(output_queue.get(), timeout=0.1)
+                            yield item
+                        except asyncio.TimeoutError:
+                            # Check if process is done
+                            if process_task.done():
+                                break
+                            continue
+                    
+                    # Wait for all tasks to complete
+                    await asyncio.gather(stdout_task, stderr_task, process_task)
+                    
             except asyncio.TimeoutError:
                 process.kill()
-                await process.wait()
-                yield (-1, f'Timed out after {timeout}s')
+                stdout_task.cancel()
+                stderr_task.cancel()
+                try:
+                    await asyncio.gather(stdout_task, stderr_task, process_task)
+                except asyncio.CancelledError:
+                    pass
+                yield (None, f'Timed out after {timeout}s')
                 return
+            
             out = '\n'.join(stdout_lines)[:_MAX_OUTPUT] if stdout_lines else ''
             err = '\n'.join(stderr_lines)[:_MAX_OUTPUT] if stderr_lines else ''
             yield (process.returncode, out, err)
@@ -348,7 +393,14 @@ class DeploymentCog(commands.Cog):
         project_uuid = project_data['project_uuid']
         name         = project_data['name']
         git_url      = project_data['git_url']
-        branch       = project_data.get('default_branch', 'main')
+        branch = project_data.get('default_branch', 'main')
+        await emit(f"[GIT] Checking if branch '{branch}' exists in remote...")
+        branch_valid = await self.branch_exists(git_url, branch, pat)
+        if not branch_valid:
+            await emit(f"[FAIL] Branch '{branch}' does not exist in the repository.")
+            raise DeployError(f"Branch '{branch}' not found.")
+        await emit("[GIT] Branch exists.")
+
         fqdn         = f"{subdomain}.{_DOMAIN}"
         deploy_path  = os.path.join(_DEPLOY_BASE, subdomain)
 
@@ -620,6 +672,7 @@ class DeploymentCog(commands.Cog):
                         deploy_path=deploy_path,
                         env_file_name=env_file_name,
                         deployed_by=triggered_by,
+                        branch=branch,
                     )
                     cleanup['deployment_uuid'] = deployment_uuid
 
@@ -846,7 +899,6 @@ class DeploymentCog(commands.Cog):
                             await emit(f"[WARN] pm2 process '{pm2_name}' not confirmed.")
 
                     await emit("[HEALTH] Performing HTTP health check...")
-                    import aiohttp
                     health_ok = False
                     for attempt in range(5):
                         try:
@@ -1316,7 +1368,7 @@ class DeploymentCog(commands.Cog):
             stack         = deployment['tech_stack']
             assigned_port = deployment['assigned_port']
             pm2_name      = deployment_uuid[:12]
-            branch        = 'main'
+            branch        = deployment.get('branch', 'main')
 
             async with self._semaphore:
                 lock = self._get_project_lock(deployment['project_uuid'])
@@ -1442,7 +1494,6 @@ class DeploymentCog(commands.Cog):
                                         raise DeployError("Artisan command failed.")
 
                     await emit("[REBUILD] Performing health check...")
-                    import aiohttp
                     fqdn = f"{deployment['subdomain']}.{_DOMAIN}"
                     health_ok = False
                     for attempt in range(5):

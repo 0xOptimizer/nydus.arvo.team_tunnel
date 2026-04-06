@@ -862,16 +862,17 @@ async def create_deployment(
     deploy_path: str,
     env_file_name: str,
     deployed_by: str,
+    branch: str = 'main',
 ) -> str:
     deployment_uuid = str(uuid.uuid4())
     query = """
         INSERT INTO deployments
         (deployment_uuid, project_uuid, subdomain, tech_stack, assigned_port,
-         deploy_path, env_file_name, status, deployed_by, deployed_at)
-        VALUES (%s, %s, %s, %s, %s, %s, %s, 'pending', %s, NOW())
+         deploy_path, env_file_name, status, deployed_by, deployed_at, branch)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, 'pending', %s, NOW(), %s)
     """
     params = (deployment_uuid, project_uuid, subdomain, tech_stack, assigned_port,
-              deploy_path, env_file_name, deployed_by)
+              deploy_path, env_file_name, deployed_by, branch)
     result = await execute_query(query, params)
     if result is None:
         raise Exception("Failed to create deployment record")
