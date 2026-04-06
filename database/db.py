@@ -853,3 +853,90 @@ async def get_all_schedules() -> Optional[list]:
         (),
         fetch_all=True
     )
+
+async def create_deployment(
+    project_uuid: str,
+    subdomain: str,
+    tech_stack: str,
+    assigned_port: int,
+    deploy_path: str,
+    env_file_name: str,
+    deployed_by: str,
+) -> str:
+    deployment_uuid = str(uuid.uuid4())
+    query = """
+        INSERT INTO deployments
+        (deployment_uuid, project_uuid, subdomain, tech_stack, assigned_port,
+         deploy_path, env_file_name, status, deployed_by, deployed_at)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, 'pending', %s, NOW())
+    """
+    params = (deployment_uuid, project_uuid, subdomain, tech_stack, assigned_port,
+              deploy_path, env_file_name, deployed_by)
+    result = await execute_query(query, params)
+    if result is None:
+        raise Exception("Failed to create deployment record")
+    return deployment_uuid
+
+
+async def create_deployment_log(
+    run_uuid: str,
+    deployment_uuid: str,
+    project_uuid: str,
+    triggered_by: str,
+) -> None:
+    query = """
+        INSERT INTO deployment_logs
+        (run_uuid, deployment_uuid, project_uuid, triggered_by, status, started_at)
+        VALUES (%s, %s, %s, %s, 'running', NOW())
+    """
+    params = (run_uuid, deployment_uuid, project_uuid, triggered_by)
+    result = await execute_query(query, params)
+    if result is None:
+        logger.error(f"Failed to create deployment log for run {run_uuid}")
+
+
+async def get_deployment_by_subdomain(subdomain: str) -> Optional[Dict[str, Any]]:
+    query = "SELECT * FROM deployments WHERE subdomain = %s"
+    return await execute_query(query, (subdomain,), fetch_one=True)
+
+
+async def get_deployment_by_uuid(deployment_uuid: str) -> Optional[Dict[str, Any]]:
+    query = "SELECT * FROM deployments WHERE deployment_uuid = %s"
+    return await execute_query(query, (deployment_uuid,), fetch_one=True)
+
+
+async def get_used_deployment_ports() -> Set[int]:
+    query = """
+        SELECT DISTINCT assigned_port
+        FROM deployments
+        WHERE status IN ('pending', 'active')
+    """
+    rows = await execute_query(query, fetch_all=True)
+    if not rows:
+        return set()
+    return {row['assigned_port'] for row in rows}
+
+
+async def update_deployment(deployment_uuid: str, **kwargs) -> bool:
+    if not kwargs:
+        return True
+    set_clause = ", ".join([f"{key} = %s" for key in kwargs.keys()])
+    query = f"UPDATE deployments SET {set_clause} WHERE deployment_uuid = %s"
+    params = list(kwargs.values()) + [deployment_uuid]
+    result = await execute_query(query, params)
+    return result is not None and result >= 0
+
+
+async def update_deployment_log(
+    run_uuid: str,
+    status: str,          # 'success' or 'failed'
+    output_log: str,
+) -> bool:
+    query = """
+        UPDATE deployment_logs
+        SET status = %s, output_log = %s, completed_at = NOW()
+        WHERE run_uuid = %s
+    """
+    params = (status, output_log, run_uuid)
+    result = await execute_query(query, params)
+    return result is not None and result >= 0

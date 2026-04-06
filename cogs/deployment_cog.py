@@ -6,6 +6,7 @@ import shutil
 import uuid as uuid_lib
 from datetime import datetime, timezone
 
+import discord
 from discord.ext import commands
 
 from database.db import (
@@ -23,7 +24,7 @@ from utils.deploy_checks import (
     get_used_ports_from_nginx,
     redact_pat,
 )
-from utils.validators import validate_env_key
+from utils.validators import validate_env_key, validate_subdomain
 
 _SEMAPHORE_LIMIT = int(os.getenv('DEPLOY_MAX_CONCURRENT', '2'))
 _DEPLOY_TIMEOUT  = int(os.getenv('DEPLOY_TIMEOUT', '600'))
@@ -43,6 +44,7 @@ _MAX_OUTPUT      = 2 * 1024 * 1024
 _MAX_LOG_BYTES   = 500_000
 _DNS_RETRIES     = 12
 _DNS_DELAY       = 10.0
+_DEV_ID          = int(os.getenv('DEV_ID', '0'))
 
 
 class DeployError(Exception):
@@ -189,13 +191,13 @@ class DeploymentCog(commands.Cog):
             self._project_locks[project_uuid] = asyncio.Lock()
         return self._project_locks[project_uuid]
 
-    async def run_exec(
+    async def run_exec_stream(
         self,
         args: list,
         cwd: str = None,
         env_extra: dict = None,
         timeout: int = None,
-    ) -> tuple[int, str, str]:
+    ):
         env = os.environ.copy()
         if env_extra:
             env.update(env_extra)
@@ -208,19 +210,56 @@ class DeploymentCog(commands.Cog):
                 cwd=cwd,
                 env=env,
             )
+            loop = asyncio.get_running_loop()
+            stdout_lines = []
+            stderr_lines = []
+            async def read_stream(stream, lines_list, name):
+                while True:
+                    line = await stream.readline()
+                    if not line:
+                        break
+                    decoded = line.decode(errors='replace').rstrip()
+                    lines_list.append(decoded)
+                    yield decoded
             try:
-                stdout, stderr = await asyncio.wait_for(
-                    process.communicate(), timeout=timeout
-                )
+                async with asyncio.timeout(timeout):
+                    async for line in read_stream(process.stdout, stdout_lines, 'stdout'):
+                        yield (None, line)
+                    async for line in read_stream(process.stderr, stderr_lines, 'stderr'):
+                        yield (None, line)
+                    await process.wait()
             except asyncio.TimeoutError:
                 process.kill()
                 await process.wait()
-                return -1, '', f'Timed out after {timeout}s'
-            out = stdout[:_MAX_OUTPUT].decode(errors='replace') if stdout else ''
-            err = stderr[:_MAX_OUTPUT].decode(errors='replace') if stderr else ''
-            return process.returncode, out, err
+                yield (-1, f'Timed out after {timeout}s')
+                return
+            out = '\n'.join(stdout_lines)[:_MAX_OUTPUT] if stdout_lines else ''
+            err = '\n'.join(stderr_lines)[:_MAX_OUTPUT] if stderr_lines else ''
+            yield (process.returncode, out, err)
         except Exception as e:
-            return -1, '', f'Exec error: {e}'
+            yield (-1, '', f'Exec error: {e}')
+
+    async def run_exec(
+        self,
+        args: list,
+        cwd: str = None,
+        env_extra: dict = None,
+        timeout: int = None,
+    ) -> tuple[int, str, str]:
+        last_code = 0
+        out_parts = []
+        err_parts = []
+        async for result in self.run_exec_stream(args, cwd, env_extra, timeout):
+            if len(result) == 2:
+                code, line = result
+                if code is None:
+                    continue
+                else:
+                    last_code = code
+            else:
+                code, out, err = result
+                return code, out, err
+        return last_code, '\n'.join(out_parts), '\n'.join(err_parts)
 
     def get_stream(self, run_id: str):
         return self._active_streams.get(run_id)
@@ -326,8 +365,10 @@ class DeploymentCog(commands.Cog):
 
             async with lock:
                 try:
-                    # STEP 0: Pre-flight
-                    await emit("[CHECK] Running pre-flight checks...")
+                    valid, reason = validate_subdomain(subdomain)
+                    if not valid:
+                        await emit(f"[FAIL] {reason}")
+                        raise DeployError(reason)
 
                     if not _SERVER_IP:
                         await emit("[FAIL] SERVER_IP is not configured.")
@@ -340,7 +381,6 @@ class DeploymentCog(commands.Cog):
 
                     await emit("[CHECK] Pre-flight passed.")
 
-                    # STEP 1: Clone or update
                     await emit(f"[GIT] Preparing repository on branch '{branch}'...")
 
                     pat_url = (
@@ -359,40 +399,51 @@ class DeploymentCog(commands.Cog):
                         cleanup['makedirs'] = True
                         await emit(f"[GIT] Created directory {deploy_path}.")
 
-                        code, out, err = await self.run_exec(
+                        async for result in self.run_exec_stream(
                             ['git', 'clone', '-b', branch, pat_url, '.'],
                             cwd=deploy_path,
-                        )
-                        await emit(f"[GIT] $ git clone -b {branch} <redacted> .")
-                        for line in (out + err).splitlines():
-                            if line.strip():
-                                await emit(f"[GIT] {line.strip()}")
-
-                        if code != 0:
-                            await emit(f"[FAIL] git clone failed (exit {code}).")
-                            raise DeployError("git clone failed.")
-
+                        ):
+                            if len(result) == 2:
+                                code, line = result
+                                if code is None:
+                                    if line.strip():
+                                        await emit(f"[GIT] {line.strip()}")
+                                else:
+                                    await emit(f"[GIT] git clone finished with code {code}")
+                            else:
+                                code, out, err = result
+                                for line in (out + err).splitlines():
+                                    if line.strip():
+                                        await emit(f"[GIT] {line.strip()}")
+                                if code != 0:
+                                    await emit(f"[FAIL] git clone failed (exit {code}).")
+                                    raise DeployError("git clone failed.")
                         cleanup['cloned'] = True
                         await emit("[GIT] Clone successful.")
-
                     else:
                         await emit(f"[GIT] Directory exists. Fetching origin/{branch}...")
                         for step in [
                             ['git', 'fetch', 'origin', branch],
                             ['git', 'reset', '--hard', f'origin/{branch}'],
                         ]:
-                            code, out, err = await self.run_exec(step, cwd=deploy_path)
-                            await emit(f"[GIT] $ {' '.join(step)}")
-                            for line in (out + err).splitlines():
-                                if line.strip():
-                                    await emit(f"[GIT] {line.strip()}")
-                            if code != 0:
-                                await emit(f"[FAIL] {' '.join(step)} failed (exit {code}).")
-                                raise DeployError("Git update failed.")
-
+                            async for result in self.run_exec_stream(step, cwd=deploy_path):
+                                if len(result) == 2:
+                                    code, line = result
+                                    if code is None:
+                                        if line.strip():
+                                            await emit(f"[GIT] {line.strip()}")
+                                    else:
+                                        await emit(f"[GIT] {' '.join(step)} finished with code {code}")
+                                else:
+                                    code, out, err = result
+                                    for line in (out + err).splitlines():
+                                        if line.strip():
+                                            await emit(f"[GIT] {line.strip()}")
+                                    if code != 0:
+                                        await emit(f"[FAIL] {' '.join(step)} failed (exit {code}).")
+                                        raise DeployError("Git update failed.")
                         await emit("[GIT] Repository updated.")
 
-                    # STEP 2: Stack detection
                     await emit("[DETECT] Detecting stack...")
 
                     has_package_json = await loop.run_in_executor(
@@ -423,7 +474,6 @@ class DeploymentCog(commands.Cog):
 
                     await emit(f"[DETECT] Stack: {stack}.")
 
-                    # STEP 3: Env file
                     env_file_name = '.env.production' if (stack == 'node' and has_vite) else '.env'
                     await emit(f"[ENV] Target env file: {env_file_name}")
 
@@ -456,50 +506,73 @@ class DeploymentCog(commands.Cog):
                     else:
                         await emit("[ENV] No .env.example found. Continuing without env copy.")
 
-                    # STEP 4: Install dependencies
                     if stack == 'node':
                         await emit("[INSTALL] Running npm install...")
-                        code, out, err = await self.run_exec(
+                        async for result in self.run_exec_stream(
                             ['npm', 'install'], cwd=deploy_path
-                        )
-                        for line in (out + err).splitlines():
-                            if line.strip():
-                                await emit(f"[INSTALL] {line.strip()}")
-                        if code != 0:
-                            await emit(f"[FAIL] npm install failed (exit {code}).")
-                            raise DeployError("npm install failed.")
+                        ):
+                            if len(result) == 2:
+                                code, line = result
+                                if code is None:
+                                    if line.strip():
+                                        await emit(f"[INSTALL] {line.strip()}")
+                                else:
+                                    await emit(f"[INSTALL] npm install finished with code {code}")
+                            else:
+                                code, out, err = result
+                                for line in (out + err).splitlines():
+                                    if line.strip():
+                                        await emit(f"[INSTALL] {line.strip()}")
+                                if code != 0:
+                                    await emit(f"[FAIL] npm install failed (exit {code}).")
+                                    raise DeployError("npm install failed.")
                         await emit("[INSTALL] npm install complete.")
-
                     elif stack == 'laravel':
                         await emit("[INSTALL] Running composer install...")
-                        code, out, err = await self.run_exec(
+                        async for result in self.run_exec_stream(
                             ['composer', 'install', '--no-dev', '--optimize-autoloader'],
                             cwd=deploy_path,
-                        )
-                        for line in (out + err).splitlines():
-                            if line.strip():
-                                await emit(f"[INSTALL] {line.strip()}")
-                        if code != 0:
-                            await emit(f"[FAIL] composer install failed (exit {code}).")
-                            raise DeployError("composer install failed.")
+                        ):
+                            if len(result) == 2:
+                                code, line = result
+                                if code is None:
+                                    if line.strip():
+                                        await emit(f"[INSTALL] {line.strip()}")
+                                else:
+                                    await emit(f"[INSTALL] composer install finished with code {code}")
+                            else:
+                                code, out, err = result
+                                for line in (out + err).splitlines():
+                                    if line.strip():
+                                        await emit(f"[INSTALL] {line.strip()}")
+                                if code != 0:
+                                    await emit(f"[FAIL] composer install failed (exit {code}).")
+                                    raise DeployError("composer install failed.")
                         await emit("[INSTALL] composer install complete.")
 
-                    # STEP 5: Build
                     if stack == 'node':
                         await emit("[BUILD] Running npm run build...")
-                        code, out, err = await self.run_exec(
+                        async for result in self.run_exec_stream(
                             ['npm', 'run', 'build'],
                             cwd=deploy_path,
                             env_extra={'NODE_OPTIONS': f'--max-old-space-size={_NODE_MEM_MB}'},
-                        )
-                        for line in (out + err).splitlines():
-                            if line.strip():
-                                await emit(f"[BUILD] {line.strip()}")
-                        if code != 0:
-                            await emit(f"[FAIL] npm run build failed (exit {code}).")
-                            raise DeployError("npm build failed.")
+                        ):
+                            if len(result) == 2:
+                                code, line = result
+                                if code is None:
+                                    if line.strip():
+                                        await emit(f"[BUILD] {line.strip()}")
+                                else:
+                                    await emit(f"[BUILD] npm run build finished with code {code}")
+                            else:
+                                code, out, err = result
+                                for line in (out + err).splitlines():
+                                    if line.strip():
+                                        await emit(f"[BUILD] {line.strip()}")
+                                if code != 0:
+                                    await emit(f"[FAIL] npm run build failed (exit {code}).")
+                                    raise DeployError("npm build failed.")
                         await emit("[BUILD] Build complete.")
-
                     elif stack == 'laravel':
                         await emit("[BUILD] Running Laravel artisan setup...")
                         for artisan_cmd in [
@@ -508,17 +581,24 @@ class DeploymentCog(commands.Cog):
                             ['php', 'artisan', 'route:cache'],
                             ['php', 'artisan', 'view:cache'],
                         ]:
-                            code, out, err = await self.run_exec(artisan_cmd, cwd=deploy_path)
-                            await emit(f"[BUILD] $ {' '.join(artisan_cmd)}")
-                            for line in (out + err).splitlines():
-                                if line.strip():
-                                    await emit(f"[BUILD] {line.strip()}")
-                            if code != 0:
-                                await emit(f"[FAIL] {' '.join(artisan_cmd)} failed (exit {code}).")
-                                raise DeployError("Artisan command failed.")
+                            async for result in self.run_exec_stream(artisan_cmd, cwd=deploy_path):
+                                if len(result) == 2:
+                                    code, line = result
+                                    if code is None:
+                                        if line.strip():
+                                            await emit(f"[BUILD] {line.strip()}")
+                                    else:
+                                        await emit(f"[BUILD] {' '.join(artisan_cmd)} finished with code {code}")
+                                else:
+                                    code, out, err = result
+                                    for line in (out + err).splitlines():
+                                        if line.strip():
+                                            await emit(f"[BUILD] {line.strip()}")
+                                    if code != 0:
+                                        await emit(f"[FAIL] {' '.join(artisan_cmd)} failed (exit {code}).")
+                                        raise DeployError("Artisan command failed.")
                         await emit("[BUILD] Laravel setup complete.")
 
-                    # STEP 6: Port assignment (Node only)
                     assigned_port: int | None = None
                     if stack == 'node':
                         await emit("[PORT] Scanning for an available port...")
@@ -531,7 +611,6 @@ class DeploymentCog(commands.Cog):
                             raise DeployError("Port exhaustion.")
                         await emit(f"[PORT] Assigned port {assigned_port}.")
 
-                    # STEP 7: Record deployment
                     await emit("[DB] Saving deployment record...")
                     deployment_uuid = await create_deployment(
                         project_uuid=project_uuid,
@@ -552,7 +631,6 @@ class DeploymentCog(commands.Cog):
                     )
                     await emit(f"[DB] Deployment UUID: {deployment_uuid}.")
 
-                    # STEP 8: Nginx HTTP config
                     await emit("[NGINX] Writing initial HTTP nginx config...")
 
                     http_config = (
@@ -594,7 +672,6 @@ class DeploymentCog(commands.Cog):
                         raise DeployError("nginx reload failed (HTTP).")
                     await emit("[NGINX] nginx reloaded with HTTP config.")
 
-                    # STEP 9: Cloudflare DNS (unproxied for certbot)
                     await emit(f"[DNS] Creating DNS A record for {fqdn} (unproxied)...")
 
                     cf_cog = self.bot.get_cog('CloudflareCog')
@@ -618,7 +695,6 @@ class DeploymentCog(commands.Cog):
                     await update_deployment(deployment_uuid, cf_record_id=cf_record['id'])
                     await emit(f"[DNS] Record created (unproxied). ID: {cf_record['id']}")
 
-                    # STEP 10: DNS propagation
                     await emit(
                         f"[DNS] Waiting for propagation "
                         f"(up to {int(_DNS_RETRIES * _DNS_DELAY)}s)..."
@@ -634,7 +710,6 @@ class DeploymentCog(commands.Cog):
                             "Proceeding anyway; certbot may fail."
                         )
 
-                    # STEP 11: SSL via certbot
                     await emit(f"[SSL] Obtaining Let's Encrypt certificate for {fqdn}...")
                     code, out, err = await self.run_exec(
                         [
@@ -654,7 +729,6 @@ class DeploymentCog(commands.Cog):
                         raise DeployError("certbot SSL provisioning failed.")
                     await emit(f"[SSL] Certificate obtained for {fqdn}.")
 
-                    # STEP 12: Write full SSL nginx config
                     await emit("[NGINX] Writing full SSL nginx config...")
 
                     ssl_config = (
@@ -686,7 +760,6 @@ class DeploymentCog(commands.Cog):
                         raise DeployError("nginx reload failed (SSL).")
                     await emit("[NGINX] nginx reloaded with SSL config.")
 
-                    # STEP 13: Enable Cloudflare proxy
                     await emit("[DNS] Enabling Cloudflare proxy on DNS record...")
                     _, cf_upd_err = await cf_cog.update_dns_record(
                         record_id=cf_record['id'],
@@ -705,34 +778,51 @@ class DeploymentCog(commands.Cog):
                     else:
                         await emit("[DNS] Cloudflare proxy enabled.")
 
-                    # STEP 14: Process start (Node only)
                     pm2_name = deployment_uuid[:12]
                     if stack == 'node':
                         await emit(f"[PM2] Starting process '{pm2_name}' on port {assigned_port}...")
 
                         code_desc, _, _ = await self.run_exec(['pm2', 'describe', pm2_name])
                         if code_desc == 0:
-                            code, out, err = await self.run_exec(
+                            async for result in self.run_exec_stream(
                                 ['pm2', 'reload', pm2_name], cwd=deploy_path
-                            )
+                            ):
+                                if len(result) == 2:
+                                    code, line = result
+                                    if code is None:
+                                        if line.strip():
+                                            await emit(f"[PM2] {line.strip()}")
+                                else:
+                                    code, out, err = result
+                                    for line in (out + err).splitlines():
+                                        if line.strip():
+                                            await emit(f"[PM2] {line.strip()}")
+                                    if code != 0:
+                                        await emit(f"[FAIL] pm2 reload failed (exit {code}).")
+                                        raise DeployError("pm2 reload failed.")
                         else:
-                            code, out, err = await self.run_exec(
+                            async for result in self.run_exec_stream(
                                 ['pm2', 'start', 'npm', '--name', pm2_name, '--', 'start'],
                                 cwd=deploy_path,
                                 env_extra={'PORT': str(assigned_port)},
-                            )
-
-                        for line in (out + err).splitlines():
-                            if line.strip():
-                                await emit(f"[PM2] {line.strip()}")
-                        if code != 0:
-                            await emit(f"[FAIL] pm2 failed (exit {code}).")
-                            raise DeployError("pm2 start/reload failed.")
+                            ):
+                                if len(result) == 2:
+                                    code, line = result
+                                    if code is None:
+                                        if line.strip():
+                                            await emit(f"[PM2] {line.strip()}")
+                                else:
+                                    code, out, err = result
+                                    for line in (out + err).splitlines():
+                                        if line.strip():
+                                            await emit(f"[PM2] {line.strip()}")
+                                    if code != 0:
+                                        await emit(f"[FAIL] pm2 start failed (exit {code}).")
+                                        raise DeployError("pm2 start failed.")
 
                         cleanup['pm2_name'] = pm2_name
                         await emit(f"[PM2] Process '{pm2_name}' running on port {assigned_port}.")
 
-                    # STEP 15: Final verification
                     await emit("[CHECK] Running final verification...")
 
                     cert_path = f"/etc/letsencrypt/live/{fqdn}/fullchain.pem"
@@ -755,7 +845,29 @@ class DeploymentCog(commands.Cog):
                         else:
                             await emit(f"[WARN] pm2 process '{pm2_name}' not confirmed.")
 
-                    # STEP 16: Finalize
+                    await emit("[HEALTH] Performing HTTP health check...")
+                    import aiohttp
+                    health_ok = False
+                    for attempt in range(5):
+                        try:
+                            async with aiohttp.ClientSession() as session:
+                                async with session.get(f"https://{fqdn}", timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                                    if resp.status == 200:
+                                        health_ok = True
+                                        await emit(f"[HEALTH] Site responded with HTTP {resp.status} (attempt {attempt+1}/5).")
+                                        break
+                                    else:
+                                        await emit(f"[HEALTH] HTTP {resp.status} (attempt {attempt+1}/5).")
+                        except Exception as e:
+                            await emit(f"[HEALTH] Error: {e} (attempt {attempt+1}/5).")
+                        if attempt < 4:
+                            await asyncio.sleep(3)
+                    if health_ok:
+                        await emit("[HEALTH] Health check passed.")
+                    else:
+                        await emit("[HEALTH] Health check failed. Site may be unreachable.")
+                        await update_deployment(deployment_uuid, status='unhealthy')
+
                     await update_deployment(
                         deployment_uuid,
                         status='active',
@@ -878,6 +990,56 @@ class DeploymentCog(commands.Cog):
             await emit(f"[CLEANUP] Removed deploy directory {cleanup['deploy_path']}.")
 
         await emit("[CLEANUP] Rollback complete.")
+
+    async def delete_deployment(self, deployment_uuid: str) -> tuple[bool, str]:
+        deployment = await get_deployment_by_uuid(deployment_uuid)
+        if not deployment:
+            return False, "Deployment not found."
+
+        fqdn = f"{deployment['subdomain']}.{_DOMAIN}"
+        loop = asyncio.get_running_loop()
+
+        if deployment['tech_stack'] == 'node' and deployment['assigned_port']:
+            pm2_name = deployment_uuid[:12]
+            code, _, _ = await self.run_exec(['pm2', 'delete', pm2_name])
+            if code != 0:
+                self.logger.warning(f"Could not delete pm2 process {pm2_name} for {deployment_uuid}")
+
+        nginx_config_path = os.path.join(_NGINX_AVAILABLE, fqdn)
+        nginx_symlink_path = os.path.join(_NGINX_ENABLED, fqdn)
+
+        def _remove_nginx():
+            try:
+                if os.path.islink(nginx_symlink_path):
+                    os.remove(nginx_symlink_path)
+                if os.path.exists(nginx_config_path):
+                    os.remove(nginx_config_path)
+            except Exception as e:
+                self.logger.warning(f"Nginx cleanup error: {e}")
+
+        await loop.run_in_executor(None, _remove_nginx)
+
+        await self.run_exec(['systemctl', 'reload', 'nginx'], timeout=30)
+
+        cf_cog = self.bot.get_cog('CloudflareCog')
+        if cf_cog and deployment.get('cf_record_id'):
+            await cf_cog.delete_dns_record(deployment['cf_record_id'])
+
+        await self.run_exec(
+            ['certbot', 'delete', '--cert-name', fqdn, '--non-interactive'],
+            timeout=60
+        )
+
+        if deployment.get('deploy_path'):
+            def _rm_deploy():
+                try:
+                    shutil.rmtree(deployment['deploy_path'])
+                except Exception:
+                    pass
+            await loop.run_in_executor(None, _rm_deploy)
+
+        await update_deployment(deployment_uuid, status='deleted')
+        return True, "Deployment deleted successfully."
 
     async def get_env_lines(self, deployment_uuid: str) -> tuple[list, str]:
         deployment = await get_deployment_by_uuid(deployment_uuid)
@@ -1154,36 +1316,72 @@ class DeploymentCog(commands.Cog):
             stack         = deployment['tech_stack']
             assigned_port = deployment['assigned_port']
             pm2_name      = deployment_uuid[:12]
+            branch        = 'main'
 
             async with self._semaphore:
                 lock = self._get_project_lock(deployment['project_uuid'])
                 async with lock:
                     await emit(f"[REBUILD] Starting rebuild for {deployment_uuid[:8]}...")
 
+                    await emit("[REBUILD] Fetching latest code from git...")
+                    for step in [
+                        ['git', 'fetch', 'origin', branch],
+                        ['git', 'reset', '--hard', f'origin/{branch}'],
+                    ]:
+                        async for result in self.run_exec_stream(step, cwd=deploy_path):
+                            if len(result) == 2:
+                                code, line = result
+                                if code is None:
+                                    if line.strip():
+                                        await emit(f"[GIT] {line.strip()}")
+                            else:
+                                code, out, err = result
+                                for line in (out + err).splitlines():
+                                    if line.strip():
+                                        await emit(f"[GIT] {line.strip()}")
+                                if code != 0:
+                                    await emit(f"[FAIL] {' '.join(step)} failed (exit {code}).")
+                                    raise DeployError("Git update failed.")
+                    await emit("[REBUILD] Git update complete.")
+
                     if stack == 'node':
                         await emit("[REBUILD] npm install...")
-                        code, out, err = await self.run_exec(
+                        async for result in self.run_exec_stream(
                             ['npm', 'install'], cwd=deploy_path
-                        )
-                        for line in (out + err).splitlines():
-                            if line.strip():
-                                await emit(f"[INSTALL] {line.strip()}")
-                        if code != 0:
-                            await emit(f"[FAIL] npm install failed (exit {code}).")
-                            raise DeployError("npm install failed.")
+                        ):
+                            if len(result) == 2:
+                                code, line = result
+                                if code is None:
+                                    if line.strip():
+                                        await emit(f"[INSTALL] {line.strip()}")
+                            else:
+                                code, out, err = result
+                                for line in (out + err).splitlines():
+                                    if line.strip():
+                                        await emit(f"[INSTALL] {line.strip()}")
+                                if code != 0:
+                                    await emit(f"[FAIL] npm install failed (exit {code}).")
+                                    raise DeployError("npm install failed.")
 
                         await emit("[REBUILD] npm run build...")
-                        code, out, err = await self.run_exec(
+                        async for result in self.run_exec_stream(
                             ['npm', 'run', 'build'],
                             cwd=deploy_path,
                             env_extra={'NODE_OPTIONS': f'--max-old-space-size={_NODE_MEM_MB}'},
-                        )
-                        for line in (out + err).splitlines():
-                            if line.strip():
-                                await emit(f"[BUILD] {line.strip()}")
-                        if code != 0:
-                            await emit(f"[FAIL] Build failed (exit {code}).")
-                            raise DeployError("Build failed.")
+                        ):
+                            if len(result) == 2:
+                                code, line = result
+                                if code is None:
+                                    if line.strip():
+                                        await emit(f"[BUILD] {line.strip()}")
+                            else:
+                                code, out, err = result
+                                for line in (out + err).splitlines():
+                                    if line.strip():
+                                        await emit(f"[BUILD] {line.strip()}")
+                                if code != 0:
+                                    await emit(f"[FAIL] Build failed (exit {code}).")
+                                    raise DeployError("Build failed.")
 
                         await emit(f"[REBUILD] Restarting pm2 process '{pm2_name}'...")
                         code, out, err = await self.run_exec(
@@ -1205,30 +1403,66 @@ class DeploymentCog(commands.Cog):
 
                     elif stack == 'laravel':
                         await emit("[REBUILD] composer install...")
-                        code, out, err = await self.run_exec(
+                        async for result in self.run_exec_stream(
                             ['composer', 'install', '--no-dev', '--optimize-autoloader'],
                             cwd=deploy_path,
-                        )
-                        for line in (out + err).splitlines():
-                            if line.strip():
-                                await emit(f"[INSTALL] {line.strip()}")
-                        if code != 0:
-                            await emit(f"[FAIL] composer install failed (exit {code}).")
-                            raise DeployError("composer install failed.")
+                        ):
+                            if len(result) == 2:
+                                code, line = result
+                                if code is None:
+                                    if line.strip():
+                                        await emit(f"[INSTALL] {line.strip()}")
+                            else:
+                                code, out, err = result
+                                for line in (out + err).splitlines():
+                                    if line.strip():
+                                        await emit(f"[INSTALL] {line.strip()}")
+                                if code != 0:
+                                    await emit(f"[FAIL] composer install failed (exit {code}).")
+                                    raise DeployError("composer install failed.")
 
                         for artisan_cmd in [
                             ['php', 'artisan', 'config:cache'],
                             ['php', 'artisan', 'route:cache'],
                             ['php', 'artisan', 'view:cache'],
                         ]:
-                            code, out, err = await self.run_exec(artisan_cmd, cwd=deploy_path)
-                            await emit(f"[BUILD] $ {' '.join(artisan_cmd)}")
-                            for line in (out + err).splitlines():
-                                if line.strip():
-                                    await emit(f"[BUILD] {line.strip()}")
-                            if code != 0:
-                                await emit(f"[FAIL] {' '.join(artisan_cmd)} failed (exit {code}).")
-                                raise DeployError("Artisan command failed.")
+                            async for result in self.run_exec_stream(artisan_cmd, cwd=deploy_path):
+                                if len(result) == 2:
+                                    code, line = result
+                                    if code is None:
+                                        if line.strip():
+                                            await emit(f"[BUILD] {line.strip()}")
+                                else:
+                                    code, out, err = result
+                                    for line in (out + err).splitlines():
+                                        if line.strip():
+                                            await emit(f"[BUILD] {line.strip()}")
+                                    if code != 0:
+                                        await emit(f"[FAIL] {' '.join(artisan_cmd)} failed (exit {code}).")
+                                        raise DeployError("Artisan command failed.")
+
+                    await emit("[REBUILD] Performing health check...")
+                    import aiohttp
+                    fqdn = f"{deployment['subdomain']}.{_DOMAIN}"
+                    health_ok = False
+                    for attempt in range(5):
+                        try:
+                            async with aiohttp.ClientSession() as session:
+                                async with session.get(f"https://{fqdn}", timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                                    if resp.status == 200:
+                                        health_ok = True
+                                        await emit(f"[HEALTH] Site responded with HTTP {resp.status} (attempt {attempt+1}/5).")
+                                        break
+                                    else:
+                                        await emit(f"[HEALTH] HTTP {resp.status} (attempt {attempt+1}/5).")
+                        except Exception as e:
+                            await emit(f"[HEALTH] Error: {e} (attempt {attempt+1}/5).")
+                        if attempt < 4:
+                            await asyncio.sleep(3)
+                    if health_ok:
+                        await emit("[HEALTH] Health check passed.")
+                    else:
+                        await emit("[HEALTH] Health check failed after rebuild.")
 
                     success = True
                     await emit("[REBUILD] Rebuild complete.")
@@ -1251,6 +1485,65 @@ class DeploymentCog(commands.Cog):
                 await q.put(None)
             await asyncio.sleep(_STREAM_TTL)
             self._active_streams.pop(run_id, None)
+
+    async def _check_dev(self, ctx_or_interaction) -> bool:
+        user_id = ctx_or_interaction.author.id if hasattr(ctx_or_interaction, 'author') else ctx_or_interaction.user.id
+        if user_id != _DEV_ID:
+            if hasattr(ctx_or_interaction, 'send'):
+                await ctx_or_interaction.send("You are not authorized to use this command.", ephemeral=True)
+            else:
+                await ctx_or_interaction.response.send_message("You are not authorized to use this command.", ephemeral=True)
+            return False
+        return True
+
+    @commands.slash_command(name="deploy", description="Deploy a new project")
+    async def slash_deploy(self, ctx: discord.ApplicationContext, project_uuid: str, subdomain: str, github_pat: str):
+        if not await self._check_dev(ctx):
+            return
+        await ctx.respond("Processing deployment...", ephemeral=True)
+        project_data = {"project_uuid": project_uuid, "name": project_uuid, "git_url": "https://github.com/example/repo.git", "default_branch": "main"}
+        run_id = self.queue_deploy(project_data, subdomain, github_pat, str(ctx.author.id))
+        embed = discord.Embed(title="Deployment Started", description=f"Run ID: `{run_id}`\nSubdomain: `{subdomain}`", color=discord.Color.blue())
+        await ctx.send_followup(embed=embed)
+
+    @commands.slash_command(name="logs", description="Stream logs for a deployment run")
+    async def slash_logs(self, ctx: discord.ApplicationContext, run_uuid: str):
+        if not await self._check_dev(ctx):
+            return
+        q = self.get_stream(run_uuid)
+        if not q:
+            await ctx.respond("No active stream for that run ID.", ephemeral=True)
+            return
+        await ctx.respond(f"Streaming logs for `{run_uuid}`...", ephemeral=True)
+        while True:
+            try:
+                line = await asyncio.wait_for(q.get(), timeout=30.0)
+                if line is None:
+                    await ctx.send_followup("Log stream ended.", ephemeral=True)
+                    break
+                await ctx.send_followup(f"```\n{line}\n```", ephemeral=True)
+            except asyncio.TimeoutError:
+                await ctx.send_followup("Log stream timed out.", ephemeral=True)
+                break
+
+    @commands.slash_command(name="delete", description="Delete a deployment")
+    async def slash_delete(self, ctx: discord.ApplicationContext, deployment_uuid: str):
+        if not await self._check_dev(ctx):
+            return
+        await ctx.respond(f"Deleting deployment `{deployment_uuid}`...", ephemeral=True)
+        ok, msg = await self.delete_deployment(deployment_uuid)
+        if ok:
+            await ctx.send_followup(f"{msg}", ephemeral=True)
+        else:
+            await ctx.send_followup(f"{msg}", ephemeral=True)
+
+    @commands.slash_command(name="rebuild", description="Rebuild an existing deployment")
+    async def slash_rebuild(self, ctx: discord.ApplicationContext, deployment_uuid: str):
+        if not await self._check_dev(ctx):
+            return
+        await ctx.respond(f"Rebuilding deployment `{deployment_uuid}`...", ephemeral=True)
+        run_id = self.queue_rebuild(deployment_uuid, str(ctx.author.id))
+        await ctx.send_followup(f"Rebuild started. Run ID: `{run_id}`\nUse `/logs {run_id}` to watch.", ephemeral=True)
 
 
 def setup(bot):
