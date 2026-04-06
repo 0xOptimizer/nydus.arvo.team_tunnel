@@ -905,7 +905,7 @@ async def get_deployment_by_uuid(deployment_uuid: str) -> Optional[dict[str, any
     return await execute_query(query, (deployment_uuid,), fetch_one=True)
 
 
-async def get_used_deployment_ports() -> Set[int]:
+async def get_used_deployment_ports() -> set[int]:
     query = """
         SELECT DISTINCT assigned_port
         FROM deployments
