@@ -749,7 +749,7 @@ class DeploymentCog(commands.Cog):
                     cleanup['nginx_symlink'] = nginx_symlink_path
                     await emit("[NGINX] Symlink created in sites-enabled.")
 
-                    code, out, err = await self.run_exec(['nginx', '-t'], timeout=30)
+                    code, out, err = await self.run_exec(['sudo', 'nginx', '-t'], timeout=30)
                     for line in (out + err).splitlines():
                         if line.strip():
                             await emit(f"[NGINX] {line.strip()}")
@@ -758,7 +758,7 @@ class DeploymentCog(commands.Cog):
                         raise DeployError("nginx -t failed (HTTP).")
 
                     code, _, err = await self.run_exec(
-                        ['systemctl', 'reload', 'nginx'], timeout=30
+                        ['sudo', 'systemctl', 'reload', 'nginx'], timeout=30
                     )
                     if code != 0:
                         await emit(f"[FAIL] nginx reload failed: {err.strip()}")
@@ -806,7 +806,7 @@ class DeploymentCog(commands.Cog):
                     await emit(f"[SSL] Obtaining Let's Encrypt certificate for {fqdn}...")
                     code, out, err = await self.run_exec(
                         [
-                            'certbot', 'certonly', '--nginx',
+                            'sudo', 'certbot', 'certonly', '--nginx',
                             '-d', fqdn,
                             '--non-interactive',
                             '--agree-tos',
@@ -837,7 +837,7 @@ class DeploymentCog(commands.Cog):
                     await loop.run_in_executor(None, _write_ssl)
                     await emit("[NGINX] SSL config written.")
 
-                    code, out, err = await self.run_exec(['nginx', '-t'], timeout=30)
+                    code, out, err = await self.run_exec(['sudo', 'nginx', '-t'], timeout=30)
                     for line in (out + err).splitlines():
                         if line.strip():
                             await emit(f"[NGINX] {line.strip()}")
@@ -846,7 +846,7 @@ class DeploymentCog(commands.Cog):
                         raise DeployError("nginx -t failed (SSL).")
 
                     code, _, err = await self.run_exec(
-                        ['systemctl', 'reload', 'nginx'], timeout=30
+                        ['sudo', 'systemctl', 'reload', 'nginx'], timeout=30
                     )
                     if code != 0:
                         await emit(f"[FAIL] nginx reload failed (SSL): {err.strip()}")
@@ -925,7 +925,7 @@ class DeploymentCog(commands.Cog):
                     else:
                         await emit(f"[WARN] SSL certificate not found at {cert_path}.")
 
-                    code, out, err = await self.run_exec(['nginx', '-t'], timeout=30)
+                    code, out, err = await self.run_exec(['sudo', 'nginx', '-t'], timeout=30)
                     if code == 0:
                         await emit("[CHECK] nginx config is valid.")
                     else:
@@ -1043,9 +1043,9 @@ class DeploymentCog(commands.Cog):
             await emit("[CLEANUP] nginx config removed.")
 
         if cleanup.get('nginx_config') or cleanup.get('nginx_symlink'):
-            code, out, err = await self.run_exec(['nginx', '-t'], timeout=30)
+            code, out, err = await self.run_exec(['sudo', 'nginx', '-t'], timeout=30)
             if code == 0:
-                await self.run_exec(['systemctl', 'reload', 'nginx'], timeout=30)
+                await self.run_exec(['sudo', 'systemctl', 'reload', 'nginx'], timeout=30)
                 await emit("[CLEANUP] nginx reloaded.")
             else:
                 await emit(
@@ -1111,14 +1111,14 @@ class DeploymentCog(commands.Cog):
 
         await loop.run_in_executor(None, _remove_nginx)
 
-        await self.run_exec(['systemctl', 'reload', 'nginx'], timeout=30)
+        await self.run_exec(['sudo', 'systemctl', 'reload', 'nginx'], timeout=30)
 
         cf_cog = self.bot.get_cog('CloudflareCog')
         if cf_cog and deployment.get('cf_record_id'):
             await cf_cog.delete_dns_record(deployment['cf_record_id'])
 
         await self.run_exec(
-            ['certbot', 'delete', '--cert-name', fqdn, '--non-interactive'],
+            ['sudo', 'certbot', 'delete', '--cert-name', fqdn, '--non-interactive'],
             timeout=60
         )
 
