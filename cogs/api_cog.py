@@ -956,7 +956,7 @@ class ApiCog(commands.Cog):
         return self.json_response(deployment)
 
     async def handle_deploy(self, request):
-        """POST /api/deploy  body: {project_uuid, subdomain, github_pat}"""
+        """POST /api/deploy  body: {project_uuid, subdomain, github_pat, triggered_by}"""
         dep_cog = self.bot.get_cog('DeploymentCog')
         if not dep_cog:
             return self.json_response({'error': 'Deployment module unavailable'}, status=503)
@@ -965,21 +965,26 @@ class ApiCog(commands.Cog):
             project_uuid = data.get('project_uuid')
             subdomain = data.get('subdomain')
             github_pat = data.get('github_pat')
-            if not all([project_uuid, subdomain, github_pat]):
-                return self.json_response({'error': 'Missing project_uuid, subdomain, or github_pat'}, status=400)
-            # Fetch project data (you need a get_project_by_uuid function)
+            triggered_by = data.get('triggered_by')
+            
+            if not all([project_uuid, subdomain, github_pat, triggered_by]):
+                return self.json_response(
+                    {'error': 'Missing project_uuid, subdomain, github_pat, or triggered_by'}, 
+                    status=400
+                )
+            
             from database.db import get_github_project_by_uuid
             project = await get_github_project_by_uuid(project_uuid)
             if not project:
                 return self.json_response({'error': 'Project not found'}, status=404)
-            # Map project fields to what DeploymentCog expects
+            
             project_data = {
                 'project_uuid': project['project_uuid'],
                 'name': project['name'],
                 'git_url': project['git_url'],
                 'default_branch': project.get('branch', 'main')
             }
-            triggered_by = request.get('auth_key_data', {}).get('owner_discord_id', 'api')
+            
             run_id = dep_cog.queue_deploy(project_data, subdomain, github_pat, triggered_by)
             return self.json_response({'run_id': run_id}, status=202)
         except Exception as e:
