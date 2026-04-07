@@ -694,7 +694,33 @@ class DeploymentCog(commands.Cog):
                     assigned_port: int | None = None
                     if stack == 'node':
                         await emit("[PORT] Scanning for an available port...")
-                        nginx_ports   = await get_used_ports_from_nginx(_NGINX_AVAILABLE)
+                        
+                        # Manually check nginx config files one by one (except default)
+                        def _scan_nginx_ports():
+                            ports = set()
+                            try:
+                                for config_file in os.listdir(_NGINX_AVAILABLE):
+                                    if config_file == 'default':
+                                        continue
+                                    config_path = os.path.join(_NGINX_AVAILABLE, config_file)
+                                    if not os.path.isfile(config_path):
+                                        continue
+                                    with open(config_path, 'r', errors='replace') as f:
+                                        content = f.read()
+                                        for line in content.splitlines():
+                                            line = line.strip()
+                                            if 'proxy_pass http://localhost:' in line:
+                                                try:
+                                                    port_str = line.split('localhost:')[1].split(';')[0].split('/')[0].strip()
+                                                    port = int(port_str)
+                                                    ports.add(port)
+                                                except (ValueError, IndexError):
+                                                    pass
+                            except Exception:
+                                pass
+                            return ports
+                        
+                        nginx_ports = await loop.run_in_executor(None, _scan_nginx_ports)
                         db_ports      = await get_used_deployment_ports()
                         used_ports    = nginx_ports | db_ports
                         assigned_port = assign_free_port(used_ports, _PORT_MIN, _PORT_MAX)
@@ -792,9 +818,22 @@ class DeploymentCog(commands.Cog):
                         f"[DNS] Waiting for propagation "
                         f"(up to {int(_DNS_RETRIES * _DNS_DELAY)}s)..."
                     )
-                    propagated = await check_dns_propagated(
-                        fqdn, _SERVER_IP, _DNS_RETRIES, _DNS_DELAY
+                    
+                    # Create a task for DNS propagation check
+                    propagation_task = asyncio.create_task(
+                        check_dns_propagated(fqdn, _SERVER_IP, _DNS_RETRIES, _DNS_DELAY)
                     )
+                    
+                    # Keep-alive pings while waiting (without logging)
+                    q = self._active_streams.get(run_id)
+                    while not propagation_task.done():
+                        try:
+                            await asyncio.wait_for(asyncio.shield(propagation_task), timeout=15)
+                        except asyncio.TimeoutError:
+                            if q:
+                                await q.put("[DNS] Still waiting for propagation...")
+                    
+                    propagated = propagation_task.result()
                     if propagated:
                         await emit("[DNS] DNS propagated successfully.")
                     else:
