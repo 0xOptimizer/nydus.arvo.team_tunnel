@@ -29,7 +29,7 @@ from utils.validators import validate_env_key, validate_subdomain
 
 _SEMAPHORE_LIMIT = int(os.getenv('DEPLOY_MAX_CONCURRENT', '2'))
 _DEPLOY_TIMEOUT  = int(os.getenv('DEPLOY_TIMEOUT', '600'))
-_PORT_MIN        = int(os.getenv('DEPLOYMENT_PORT_MIN', '3000'))
+_PORT_MIN        = int(os.getenv('DEPLOYMENT_PORT_MIN', '3100'))
 _PORT_MAX        = int(os.getenv('DEPLOYMENT_PORT_MAX', '3999'))
 _NGINX_AVAILABLE = '/etc/nginx/sites-available'
 _NGINX_ENABLED   = '/etc/nginx/sites-enabled'
