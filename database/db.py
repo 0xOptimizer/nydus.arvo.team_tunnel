@@ -961,3 +961,46 @@ async def get_all_deployments(project_uuid: str = None, status: str = None) -> l
 async def get_github_project_by_uuid(project_uuid: str):
     query = "SELECT * FROM projects WHERE project_uuid = %s"
     return await execute_query(query, (project_uuid,), fetch_one=True)
+
+async def create_tusd_upload(
+    upload_id: str,
+    filename: str,
+    filetype: str,
+    file_path: str,
+    file_size: int,
+    ip_address: str,
+    user_agent: str,
+    status: str = "pending"
+) -> bool:
+    query = """
+        INSERT INTO tusd_uploads
+        (uuid, filename, filetype, file_path, file_size, ip_address, user_agent, status)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+    """
+    result = await execute_query(
+        query,
+        (upload_id, filename, filetype, file_path, file_size, ip_address, user_agent, status)
+    )
+    return result is not None
+
+
+async def create_tusd_upload_meta(upload_uuid: str, metadata: dict) -> bool:
+    query = """
+        INSERT INTO tusd_upload_meta (upload_uuid, meta_key, meta_value)
+        VALUES (%s, %s, %s)
+    """
+    for key, value in metadata.items():
+        result = await execute_query(query, (upload_uuid, key, str(value)))
+        if result is None:
+            return False
+    return True
+
+
+async def update_tusd_upload(upload_id: str, **kwargs) -> bool:
+    if not kwargs:
+        return True
+    set_clause = ", ".join([f"{key} = %s" for key in kwargs.keys()])
+    query = f"UPDATE tusd_uploads SET {set_clause} WHERE uuid = %s"
+    params = list(kwargs.values()) + [upload_id]
+    result = await execute_query(query, params)
+    return result is not None and result >= 0
