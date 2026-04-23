@@ -9,7 +9,7 @@ import json
 import logging
 import asyncio
 import discord
-from datetime import datetime
+from datetime import datetime, timedelta
 from database.db import (
     get_recent_system_resources_with_averages, get_webhook_project_by_uuid, get_all_webhook_projects, create_new_webhook_project,
     delete_webhook_project, add_github_project, get_all_github_projects, get_all_attached_projects,
@@ -17,12 +17,72 @@ from database.db import (
     get_all_recent_backups,
     get_all_schedules, get_schedule_by_uuid, set_schedule_enabled, set_schedule_next_run, create_schedule_log,
     get_all_deployments, get_deployment_by_uuid, update_deployment,
+    create_tusd_upload, create_tusd_upload_meta,
 )
+import jwt
+import bcrypt
+import re
+import aiomysql
+import uuid as uuid_lib
 
 def json_serial(obj):
     if isinstance(obj, datetime):
         return obj.isoformat()
     raise TypeError(f"Type {type(obj)} not serializable")
+
+# ------------------------------
+# TUSD <START>
+# ------------------------------
+
+UPLOAD_DESTINATIONS = {
+    "general": "/var/data/uploads",
+    "phpmyadmin": "/var/www/phpmyadmin/uploads",
+}
+
+MAX_FILENAME_LENGTH = 255
+MAX_FILETYPE_LENGTH = 128
+MAX_METADATA_PAIRS = 50
+
+def is_valid_uuid(uuid_str: str) -> bool:
+    """Validate UUID v4 format."""
+    try:
+        uuid_obj = uuid_lib.UUID(uuid_str)
+        return uuid_obj.version == 4
+    except ValueError:
+        return False
+
+def secure_filename(filename: str) -> str:
+    """Return a safe version of the filename (no path separators, null bytes)."""
+    # Block null bytes and path traversal sequences
+    if '\0' in filename or '/' in filename or '\\' in filename:
+        raise ValueError("Invalid characters in filename")
+    # Remove any leading/trailing whitespace
+    filename = filename.strip()
+    if not filename:
+        raise ValueError("Empty filename")
+    return filename
+
+# ------------------------------
+# TUSD <END>
+# ------------------------------
+
+# ------------------------------
+# UTILITIES FOR DEMO PURPOSES <START>
+# ------------------------------
+
+def _decode_attendance_jwt(self, request):
+    auth = request.headers.get('Authorization', '')
+    if not auth.startswith('Bearer '):
+        return None
+    token = auth[7:]
+    try:
+        return jwt.decode(token, os.environ['ATTENDANCE_JWT_SECRET'], algorithms=['HS256'])
+    except jwt.PyJWTError:
+        return None
+
+# ------------------------------
+# UTILITIES FOR DEMO PURPOSES <END>
+# ------------------------------
 
 class ApiCog(commands.Cog):
     def __init__(self, bot):
@@ -114,6 +174,16 @@ class ApiCog(commands.Cog):
         self._add_route('PUT', '/api/deployments/{deployment_uuid}/env', self.handle_update_env)
         self._add_route('POST', '/api/deployments/{deployment_uuid}/env', self.handle_add_env)
         self._add_route('DELETE', '/api/deployments/{deployment_uuid}/env', self.handle_delete_env)
+
+        # DEMO: School Attendance
+        self._add_route('POST', '/api/attendance/login', self.handle_attendance_login)
+        self._add_route('POST', '/api/attendance/qr-login', self.handle_attendance_qr_login)
+        self._add_route('POST', '/api/attendance/qr-scan', self.handle_attendance_qr_scan)
+        self._add_route('POST', '/api/attendance/clock', self.handle_attendance_clock)
+        self._add_route('GET',  '/api/attendance/history', self.handle_attendance_history)
+
+        # TUSD
+        self._add_route('POST', '/internal/tusd/upload-complete', self.handle_tusd_upload_complete)
 
     # ------------------------------
     # INTERNAL SERVER
@@ -1121,6 +1191,251 @@ class ApiCog(commands.Cog):
             return self.json_response({'status': 'deleted', 'key': key})
         except Exception as e:
             return self.json_response({'error': str(e)}, status=500)
+
+    async def handle_attendance_login(self, request):
+        try:
+            data = await request.json()
+            email = data.get('email')
+            password = data.get('password')
+            if not email or not password:
+                return self.json_response({'error': 'Missing email or password'}, status=400)
+    
+            attendance_cog = self.bot.get_cog('SchoolAttendanceCog')
+            if not attendance_cog:
+                return self.json_response({'error': 'Attendance module unavailable'}, status=503)
+    
+            school_pool = await attendance_cog._get_school_pool()
+            async with school_pool.acquire() as conn:
+                async with conn.cursor(aiomysql.DictCursor) as cur:
+                    await cur.execute('SELECT * FROM users WHERE email = %s', (email,))
+                    user = await cur.fetchone()
+    
+            if not user:
+                return self.json_response({'error': 'Invalid credentials'}, status=401)
+    
+            stored_hash = user.get('password') or user.get('password_hash', '')
+            if not stored_hash:
+                return self.json_response({'error': 'Invalid credentials'}, status=401)
+    
+            if not bcrypt.checkpw(password.encode('utf-8'), stored_hash.encode('utf-8')):
+                return self.json_response({'error': 'Invalid credentials'}, status=401)
+    
+            payload = {
+                'sub': user['custom_id'],
+                'email': user['email'],
+                'iat': datetime.utcnow(),
+                'exp': datetime.utcnow() + timedelta(hours=8),
+            }
+            token = jwt.encode(payload, os.environ['ATTENDANCE_JWT_SECRET'], algorithm='HS256')
+            user_safe = {k: v for k, v in user.items() if k not in ('password', 'password_hash')}
+            return self.json_response({'token': token, 'user': user_safe})
+        except Exception as e:
+            return self.json_response({'error': str(e)}, status=500)
+    
+    
+    async def handle_attendance_qr_login(self, request):
+        try:
+            data = await request.json()
+            qr_data = data.get('qr_data', '')
+    
+            match = re.match(r'id:(.+)\|token:(.+)', qr_data)
+            if not match:
+                return self.json_response({'error': 'Invalid QR format'}, status=400)
+    
+            qr_custom_id = match.group(1)
+            secure_token = match.group(2)
+    
+            attendance_cog = self.bot.get_cog('SchoolAttendanceCog')
+            if not attendance_cog:
+                return self.json_response({'error': 'Attendance module unavailable'}, status=503)
+    
+            pool = await attendance_cog._get_pool()
+            async with pool.acquire() as conn:
+                async with conn.cursor(aiomysql.DictCursor) as cur:
+                    await cur.execute(
+                        'SELECT id FROM demo_school_attendance_tokens WHERE school_custom_id = %s AND secure_token = %s',
+                        (qr_custom_id, secure_token),
+                    )
+                    token_row = await cur.fetchone()
+    
+            if not token_row:
+                return self.json_response({'error': 'Invalid QR code'}, status=401)
+    
+            school_pool = await attendance_cog._get_school_pool()
+            async with school_pool.acquire() as conn:
+                async with conn.cursor(aiomysql.DictCursor) as cur:
+                    await cur.execute('SELECT * FROM users WHERE custom_id = %s', (qr_custom_id,))
+                    user = await cur.fetchone()
+    
+            if not user:
+                return self.json_response({'error': 'User not found'}, status=404)
+    
+            payload = {
+                'sub': qr_custom_id,
+                'email': user.get('email', ''),
+                'iat': datetime.utcnow(),
+                'exp': datetime.utcnow() + timedelta(hours=8),
+            }
+            token = jwt.encode(payload, os.environ['ATTENDANCE_JWT_SECRET'], algorithm='HS256')
+            user_safe = {k: v for k, v in user.items() if k not in ('password', 'password_hash')}
+            return self.json_response({'token': token, 'user': user_safe})
+        except Exception as e:
+            return self.json_response({'error': str(e)}, status=500)
+    
+    
+    async def handle_attendance_qr_scan(self, request):
+        try:
+            decoded = _decode_attendance_jwt(self, request)
+            if not decoded:
+                return self.json_response({'error': 'Unauthorized'}, status=401)
+    
+            data = await request.json()
+            qr_data = data.get('qr_data', '')
+            from_ip = data.get('from_ip') or request.headers.get('X-Forwarded-For', request.remote)
+            from_mac = data.get('from_mac')
+            from_url = data.get('from_url')
+            user_agent = data.get('user_agent') or request.headers.get('User-Agent')
+            qr_scan_image = data.get('qr_scan_image')
+            attendance_type = data.get('attendance_type', 'time_in')
+    
+            match = re.match(r'id:(.+)\|token:(.+)', qr_data)
+            if not match:
+                return self.json_response({'error': 'Invalid QR format'}, status=400)
+    
+            qr_custom_id = match.group(1)
+            secure_token = match.group(2)
+    
+            attendance_cog = self.bot.get_cog('SchoolAttendanceCog')
+            if not attendance_cog:
+                return self.json_response({'error': 'Attendance module unavailable'}, status=503)
+    
+            pool = await attendance_cog._get_pool()
+            async with pool.acquire() as conn:
+                async with conn.cursor(aiomysql.DictCursor) as cur:
+                    await cur.execute(
+                        'SELECT id FROM demo_school_attendance_tokens WHERE school_custom_id = %s AND secure_token = %s',
+                        (qr_custom_id, secure_token),
+                    )
+                    token_row = await cur.fetchone()
+    
+            if not token_row:
+                return self.json_response({'error': 'Invalid QR code'}, status=401)
+    
+            record = await attendance_cog.create_attendance(
+                school_custom_id=qr_custom_id,
+                action_type='qr_scan',
+                attendance_timestamp=int(datetime.utcnow().timestamp()),
+                attendance_type=attendance_type,
+                from_url=from_url,
+                from_ip=from_ip,
+                from_mac=from_mac,
+                user_agent=user_agent,
+                qr_scan_image=qr_scan_image,
+            )
+            return self.json_response({'success': True, 'record': record}, status=201)
+        except Exception as e:
+            return self.json_response({'error': str(e)}, status=500)
+    
+    
+    async def handle_attendance_clock(self, request):
+        try:
+            decoded = _decode_attendance_jwt(self, request)
+            if not decoded:
+                return self.json_response({'error': 'Unauthorized'}, status=401)
+    
+            data = await request.json()
+            attendance_type = data.get('attendance_type', 'time_in')
+            from_ip = data.get('from_ip') or request.headers.get('X-Forwarded-For', request.remote)
+            from_mac = data.get('from_mac')
+            from_url = data.get('from_url')
+            user_agent = data.get('user_agent') or request.headers.get('User-Agent')
+    
+            attendance_cog = self.bot.get_cog('SchoolAttendanceCog')
+            if not attendance_cog:
+                return self.json_response({'error': 'Attendance module unavailable'}, status=503)
+    
+            record = await attendance_cog.create_attendance(
+                school_custom_id=decoded['sub'],
+                action_type='manual',
+                attendance_timestamp=int(datetime.utcnow().timestamp()),
+                attendance_type=attendance_type,
+                from_url=from_url,
+                from_ip=from_ip,
+                from_mac=from_mac,
+                user_agent=user_agent,
+            )
+            return self.json_response({'success': True, 'record': record}, status=201)
+        except Exception as e:
+            return self.json_response({'error': str(e)}, status=500)
+    
+    
+    async def handle_attendance_history(self, request):
+        try:
+            decoded = _decode_attendance_jwt(self, request)
+            if not decoded:
+                return self.json_response({'error': 'Unauthorized'}, status=401)
+    
+            try:
+                limit = int(request.query.get('limit', 100))
+                offset = int(request.query.get('offset', 0))
+            except ValueError:
+                return self.json_response({'error': 'Invalid limit or offset'}, status=400)
+    
+            attendance_cog = self.bot.get_cog('SchoolAttendanceCog')
+            if not attendance_cog:
+                return self.json_response({'error': 'Attendance module unavailable'}, status=503)
+    
+            records = await attendance_cog.get_attendances_by_custom_id(
+                school_custom_id=decoded['sub'],
+                limit=limit,
+                offset=offset,
+            )
+            return self.json_response({'records': records})
+        except Exception as e:
+            return self.json_response({'error': str(e)}, status=500)
+
+    async def create_tusd_upload(
+        upload_id: str,
+        filename: str,
+        filetype: str,
+        file_path: str,
+        file_size: int,
+        ip_address: str,
+        user_agent: str,
+        status: str = "pending"
+    ) -> bool:
+        query = """
+            INSERT INTO tusd_uploads
+            (uuid, filename, filetype, file_path, file_size, ip_address, user_agent, status)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+        """
+        result = await execute_query(
+            query,
+            (upload_id, filename, filetype, file_path, file_size, ip_address, user_agent, status)
+        )
+        return result is not None
+
+
+    async def create_tusd_upload_meta(upload_uuid: str, metadata: dict) -> bool:
+        query = """
+            INSERT INTO tusd_upload_meta (upload_uuid, meta_key, meta_value)
+            VALUES (%s, %s, %s)
+        """
+        for key, value in metadata.items():
+            result = await execute_query(query, (upload_uuid, key, str(value)))
+            if result is None:
+                return False
+        return True
+
+
+    async def update_tusd_upload(upload_id: str, **kwargs) -> bool:
+        if not kwargs:
+            return True
+        set_clause = ", ".join([f"{key} = %s" for key in kwargs.keys()])
+        query = f"UPDATE tusd_uploads SET {set_clause} WHERE uuid = %s"
+        params = list(kwargs.values()) + [upload_id]
+        result = await execute_query(query, params)
+        return result is not None and result >= 0
 
 
 def setup(bot):
