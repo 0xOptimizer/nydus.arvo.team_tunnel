@@ -1430,6 +1430,10 @@ class ApiCog(commands.Cog):
         except Exception:
             return self.json_response({"error": "Invalid JSON body"}, status=400)
 
+        asyncio.ensure_future(self._process_tusd_upload(body))
+        return self.json_response({"received": True})
+
+    async def _process_tusd_upload(self, body):
         try:
             event    = body.get("Event", {})
             upload   = event.get("Upload", {})
@@ -1437,7 +1441,8 @@ class ApiCog(commands.Cog):
 
             upload_id = upload.get("ID")
             if not upload_id or not is_valid_uuid(upload_id):
-                return self.json_response({"error": "Invalid upload ID"}, status=400)
+                self.logger.error(f"Invalid upload ID: {upload_id}")
+                return
 
             raw_metadata = upload.get("MetaData") or {}
             metadata = dict(raw_metadata)
@@ -1447,41 +1452,48 @@ class ApiCog(commands.Cog):
             upload_type = metadata.pop("upload_type", None)
 
             if not upload_type or upload_type not in UPLOAD_DESTINATIONS:
-                return self.json_response({"error": "Invalid upload_type"}, status=400)
+                self.logger.error(f"Invalid upload_type: {upload_type}")
+                return
 
             try:
                 safe_filename = secure_filename(filename)
             except ValueError as e:
-                return self.json_response({"error": str(e)}, status=400)
+                self.logger.error(f"Filename sanitization failed: {e}")
+                return
 
             if not safe_filename:
-                return self.json_response({"error": "Filename is empty after sanitization"}, status=400)
+                self.logger.error("Filename empty after sanitization")
+                return
 
             if len(safe_filename) > MAX_FILENAME_LENGTH:
-                return self.json_response({"error": "Filename too long"}, status=400)
+                self.logger.error("Filename too long")
+                return
 
             if filetype and len(filetype) > MAX_FILETYPE_LENGTH:
-                return self.json_response({"error": "Filetype too long"}, status=400)
+                self.logger.error("Filetype too long")
+                return
 
             if len(metadata) > MAX_METADATA_PAIRS:
-                return self.json_response({"error": "Too many metadata fields"}, status=400)
+                self.logger.error("Too many metadata fields")
+                return
 
             for k, v in metadata.items():
                 if len(str(k)) > MAX_META_KEY_LENGTH or len(str(v)) > MAX_META_VALUE_LENGTH:
-                    return self.json_response({"error": f"Metadata field '{k}' exceeds length limit"}, status=400)
+                    self.logger.error(f"Metadata field '{k}' exceeds length limit")
+                    return
 
             file_size = upload.get("Size", 0)
             if not isinstance(file_size, int) or file_size <= 0:
-                return self.json_response({"error": "Invalid file size"}, status=400)
+                self.logger.error(f"Invalid file size: {file_size}")
+                return
 
             staging_path = f"/var/data/uploads/{upload_id}"
             if not os.path.isfile(staging_path):
                 self.logger.error(f"Staging file not found: {staging_path}")
-                return self.json_response({"error": "Staged file not found"}, status=500)
+                return
 
             dest_dir = UPLOAD_DESTINATIONS[upload_type]
             os.makedirs(dest_dir, exist_ok=True)
-
             final_path = _unique_path(dest_dir, safe_filename)
 
             ip_address = _extract_ip(http_req.get("RemoteAddr", ""))
@@ -1498,25 +1510,25 @@ class ApiCog(commands.Cog):
                 status="pending",
             )
             if not inserted:
-                return self.json_response({"error": "Failed to create upload record"}, status=500)
+                self.logger.error(f"Failed to create upload record for {upload_id}")
+                return
 
             try:
                 shutil.move(staging_path, final_path)
             except OSError as e:
                 self.logger.error(f"File move failed {staging_path} -> {final_path}: {e}")
                 await update_tusd_upload(upload_id, status="failed")
-                return self.json_response({"error": "File move failed"}, status=500)
+                return
 
             await update_tusd_upload(upload_id, file_path=final_path, status="complete")
 
             if metadata:
                 await create_tusd_upload_meta(upload_id, metadata)
 
-            return self.json_response({"received": True})
+            self.logger.info(f"Upload complete: {upload_id} -> {final_path}")
 
         except Exception as e:
-            self.logger.exception(f"tusd webhook error: {e}")
-            return self.json_response({"error": "Internal server error"}, status=500)
+            self.logger.exception(f"tusd processing error: {e}")
 
 
 def setup(bot):
