@@ -24,6 +24,8 @@ import bcrypt
 import re
 import aiomysql
 import uuid as uuid_lib
+import shutil
+import ipaddress
 
 def json_serial(obj):
     if isinstance(obj, datetime):
@@ -42,6 +44,8 @@ UPLOAD_DESTINATIONS = {
 MAX_FILENAME_LENGTH = 255
 MAX_FILETYPE_LENGTH = 128
 MAX_METADATA_PAIRS = 50
+MAX_META_KEY_LENGTH   = 64
+MAX_META_VALUE_LENGTH = 512
 
 def is_valid_uuid(uuid_str: str) -> bool:
     """Validate UUID v4 format."""
@@ -61,6 +65,30 @@ def secure_filename(filename: str) -> str:
     if not filename:
         raise ValueError("Empty filename")
     return filename
+
+def _extract_ip(remote_addr: str) -> Optional[str]:
+    if not remote_addr:
+        return None
+    try:
+        host, _, _ = remote_addr.rpartition(":")
+        host = host.strip("[]")
+        ipaddress.ip_address(host)
+        return host
+    except ValueError:
+        return None
+
+
+def _unique_path(directory: str, filename: str) -> str:
+    candidate = os.path.join(directory, filename)
+    if not os.path.exists(candidate):
+        return candidate
+    base, ext = os.path.splitext(filename)
+    counter = 1
+    while True:
+        candidate = os.path.join(directory, f"{base}_{counter}{ext}")
+        if not os.path.exists(candidate):
+            return candidate
+        counter += 1
 
 # ------------------------------
 # TUSD <END>
@@ -1394,48 +1422,99 @@ class ApiCog(commands.Cog):
         except Exception as e:
             return self.json_response({'error': str(e)}, status=500)
 
-    async def create_tusd_upload(
-        upload_id: str,
-        filename: str,
-        filetype: str,
-        file_path: str,
-        file_size: int,
-        ip_address: str,
-        user_agent: str,
-        status: str = "pending"
-    ) -> bool:
-        query = """
-            INSERT INTO tusd_uploads
-            (uuid, filename, filetype, file_path, file_size, ip_address, user_agent, status)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
-        """
-        result = await execute_query(
-            query,
-            (upload_id, filename, filetype, file_path, file_size, ip_address, user_agent, status)
-        )
-        return result is not None
+    async def handle_tusd_upload_complete(self, request):
+        try:
+            body = await request.json()
+        except Exception:
+            return self.json_response({"error": "Invalid JSON body"}, status=400)
 
+        try:
+            event    = body.get("Event", {})
+            upload   = event.get("Upload", {})
+            http_req = event.get("HTTPRequest", {})
 
-    async def create_tusd_upload_meta(upload_uuid: str, metadata: dict) -> bool:
-        query = """
-            INSERT INTO tusd_upload_meta (upload_uuid, meta_key, meta_value)
-            VALUES (%s, %s, %s)
-        """
-        for key, value in metadata.items():
-            result = await execute_query(query, (upload_uuid, key, str(value)))
-            if result is None:
-                return False
-        return True
+            upload_id = upload.get("ID")
+            if not upload_id or not is_valid_uuid(upload_id):
+                return self.json_response({"error": "Invalid upload ID"}, status=400)
 
+            raw_metadata = upload.get("MetaData") or {}
+            metadata = dict(raw_metadata)
 
-    async def update_tusd_upload(upload_id: str, **kwargs) -> bool:
-        if not kwargs:
-            return True
-        set_clause = ", ".join([f"{key} = %s" for key in kwargs.keys()])
-        query = f"UPDATE tusd_uploads SET {set_clause} WHERE uuid = %s"
-        params = list(kwargs.values()) + [upload_id]
-        result = await execute_query(query, params)
-        return result is not None and result >= 0
+            filename    = metadata.pop("filename", "unknown")
+            filetype    = metadata.pop("filetype", None)
+            upload_type = metadata.pop("upload_type", None)
+
+            if not upload_type or upload_type not in UPLOAD_DESTINATIONS:
+                return self.json_response({"error": "Invalid upload_type"}, status=400)
+
+            try:
+                safe_filename = secure_filename(filename)
+            except ValueError as e:
+                return self.json_response({"error": str(e)}, status=400)
+
+            if not safe_filename:
+                return self.json_response({"error": "Filename is empty after sanitization"}, status=400)
+
+            if len(safe_filename) > MAX_FILENAME_LENGTH:
+                return self.json_response({"error": "Filename too long"}, status=400)
+
+            if filetype and len(filetype) > MAX_FILETYPE_LENGTH:
+                return self.json_response({"error": "Filetype too long"}, status=400)
+
+            if len(metadata) > MAX_METADATA_PAIRS:
+                return self.json_response({"error": "Too many metadata fields"}, status=400)
+
+            for k, v in metadata.items():
+                if len(str(k)) > MAX_META_KEY_LENGTH or len(str(v)) > MAX_META_VALUE_LENGTH:
+                    return self.json_response({"error": f"Metadata field '{k}' exceeds length limit"}, status=400)
+
+            file_size = upload.get("Size", 0)
+            if not isinstance(file_size, int) or file_size <= 0:
+                return self.json_response({"error": "Invalid file size"}, status=400)
+
+            staging_path = f"/var/data/uploads/{upload_id}"
+            if not os.path.isfile(staging_path):
+                self.logger.error(f"Staging file not found: {staging_path}")
+                return self.json_response({"error": "Staged file not found"}, status=500)
+
+            dest_dir = UPLOAD_DESTINATIONS[upload_type]
+            os.makedirs(dest_dir, exist_ok=True)
+
+            final_path = _unique_path(dest_dir, safe_filename)
+
+            ip_address = _extract_ip(http_req.get("RemoteAddr", ""))
+            user_agent = ((http_req.get("Header") or {}).get("User-Agent") or [None])[0]
+
+            inserted = await create_tusd_upload(
+                upload_id=upload_id,
+                filename=safe_filename,
+                filetype=filetype,
+                file_path=staging_path,
+                file_size=file_size,
+                ip_address=ip_address,
+                user_agent=user_agent,
+                status="pending",
+            )
+            if not inserted:
+                return self.json_response({"error": "Failed to create upload record"}, status=500)
+
+            try:
+                shutil.move(staging_path, final_path)
+            except OSError as e:
+                self.logger.error(f"File move failed {staging_path} -> {final_path}: {e}")
+                await update_tusd_upload(upload_id, status="failed")
+                return self.json_response({"error": "File move failed"}, status=500)
+
+            await update_tusd_upload(upload_id, file_path=final_path, status="complete")
+
+            if metadata:
+                await create_tusd_upload_meta(upload_id, metadata)
+
+            return self.json_response({"received": True})
+
+        except Exception as e:
+            self.logger.exception(f"tusd webhook error: {e}")
+            return self.json_response({"error": "Internal server error"}, status=500)
 
 
 def setup(bot):
