@@ -26,6 +26,7 @@ import aiomysql
 import uuid as uuid_lib
 import shutil
 import ipaddress
+from typing import Optional
 
 def json_serial(obj):
     if isinstance(obj, datetime):
