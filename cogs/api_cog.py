@@ -17,7 +17,7 @@ from database.db import (
     get_all_recent_backups,
     get_all_schedules, get_schedule_by_uuid, set_schedule_enabled, set_schedule_next_run, create_schedule_log,
     get_all_deployments, get_deployment_by_uuid, update_deployment,
-    create_tusd_upload, create_tusd_upload_meta,
+    create_tusd_upload, create_tusd_upload_meta, update_tusd_upload,
 )
 import jwt
 import bcrypt
