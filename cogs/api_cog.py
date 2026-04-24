@@ -213,7 +213,7 @@ class ApiCog(commands.Cog):
         self._add_route('GET',  '/api/attendance/history', self.handle_attendance_history)
 
         # TUSD
-        self._add_route('POST', '/internal/tusd/upload-complete', self.handle_tusd_upload_complete)
+        self._add_route('POST', '/tusd/upload-complete', self.handle_tusd_upload_complete)
 
     # ------------------------------
     # INTERNAL SERVER
