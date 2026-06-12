@@ -141,6 +141,62 @@ def _nginx_laravel_http(fqdn: str, deploy_path: str) -> str:
     )
 
 
+def _nginx_static_http(fqdn: str, root_dir: str) -> str:
+    return (
+        f"server {{\n"
+        f"    listen 80;\n"
+        f"    server_name {fqdn};\n"
+        f"    root {root_dir};\n"
+        f"    index index.html;\n"
+        f"\n"
+        f"    location / {{\n"
+        f"        try_files $uri $uri/ /index.html;\n"
+        f"    }}\n"
+        f"\n"
+        f"    location ~ /\\.(?!well-known).* {{\n"
+        f"        deny all;\n"
+        f"    }}\n"
+        f"}}\n"
+    )
+
+
+def _nginx_static_ssl(fqdn: str, root_dir: str) -> str:
+    return (
+        f"server {{\n"
+        f"    listen 80;\n"
+        f"    server_name {fqdn};\n"
+        f"    return 301 https://$host$request_uri;\n"
+        f"}}\n"
+        f"\n"
+        f"server {{\n"
+        f"    listen 443 ssl http2;\n"
+        f"    server_name {fqdn};\n"
+        f"\n"
+        f"    ssl_certificate /etc/letsencrypt/live/{fqdn}/fullchain.pem;\n"
+        f"    ssl_certificate_key /etc/letsencrypt/live/{fqdn}/privkey.pem;\n"
+        f"\n"
+        f"    root {root_dir};\n"
+        f"    index index.html;\n"
+        f"\n"
+        f"    access_log /var/log/nginx/{fqdn}.access.log db_log;\n"
+        f"\n"
+        f"    location / {{\n"
+        f"        try_files $uri $uri/ /index.html;\n"
+        f"    }}\n"
+        f"\n"
+        f"    location ~* \\.(?:js|css|woff2?|ttf|svg|png|jpe?g|gif|ico|webp|avif)$ {{\n"
+        f"        expires 30d;\n"
+        f"        add_header Cache-Control \"public, immutable\";\n"
+        f"        try_files $uri =404;\n"
+        f"    }}\n"
+        f"\n"
+        f"    location ~ /\\.(?!well-known).* {{\n"
+        f"        deny all;\n"
+        f"    }}\n"
+        f"}}\n"
+    )
+
+
 def _nginx_laravel_ssl(fqdn: str, deploy_path: str) -> str:
     return (
         f"server {{\n"
@@ -556,17 +612,41 @@ class DeploymentCog(commands.Cog):
                             has_vite = True
                             break
 
+                    pkg_scripts: dict = {}
+                    if has_package_json:
+                        def _read_pkg_scripts():
+                            try:
+                                with open(os.path.join(deploy_path, 'package.json'), 'r') as f:
+                                    return json.load(f).get('scripts', {}) or {}
+                            except Exception:
+                                return {}
+                        pkg_scripts = await loop.run_in_executor(None, _read_pkg_scripts)
+
                     if has_artisan and has_composer_json:
                         stack = 'laravel'
-                    elif has_package_json:
+                    elif has_package_json and 'start' in pkg_scripts:
                         stack = 'node'
+                    elif has_package_json:
+                        stack = 'static'
+                        if 'build' not in pkg_scripts:
+                            await emit(
+                                "[FAIL] package.json has neither a 'start' nor a 'build' script. "
+                                "Nothing to run or serve."
+                            )
+                            raise DeployError("No start or build script in package.json.")
                     else:
                         await emit("[FAIL] No recognizable stack detected (no package.json or artisan).")
                         raise DeployError("Unsupported stack.")
 
-                    await emit(f"[DETECT] Stack: {stack}.")
+                    if stack == 'static':
+                        await emit(
+                            "[DETECT] Stack: static (no start script — "
+                            "build output will be served directly by nginx)."
+                        )
+                    else:
+                        await emit(f"[DETECT] Stack: {stack}.")
 
-                    env_file_name = '.env.production' if (stack == 'node' and has_vite) else '.env'
+                    env_file_name = '.env.production' if (stack in ('node', 'static') and has_vite) else '.env'
                     await emit(f"[ENV] Target env file: {env_file_name}")
 
                     example_path = os.path.join(deploy_path, '.env.example')
@@ -598,7 +678,7 @@ class DeploymentCog(commands.Cog):
                     else:
                         await emit("[ENV] No .env.example found. Continuing without env copy.")
 
-                    if stack == 'node':
+                    if stack in ('node', 'static'):
                         await emit("[INSTALL] Running npm install...")
                         async for result in self.run_exec_stream(
                             ['npm', 'install'], cwd=deploy_path
@@ -642,7 +722,7 @@ class DeploymentCog(commands.Cog):
                                     raise DeployError("composer install failed.")
                         await emit("[INSTALL] composer install complete.")
 
-                    if stack == 'node':
+                    if stack in ('node', 'static') and 'build' in pkg_scripts:
                         await emit("[BUILD] Running npm run build...")
                         async for result in self.run_exec_stream(
                             ['npm', 'run', 'build'],
@@ -690,6 +770,22 @@ class DeploymentCog(commands.Cog):
                                         await emit(f"[FAIL] {' '.join(artisan_cmd)} failed (exit {code}).")
                                         raise DeployError("Artisan command failed.")
                         await emit("[BUILD] Laravel setup complete.")
+
+                    static_root: str | None = None
+                    if stack == 'static':
+                        await emit("[STATIC] Locating build output directory...")
+                        for candidate in ('dist', 'build', 'out'):
+                            candidate_index = os.path.join(deploy_path, candidate, 'index.html')
+                            if await loop.run_in_executor(None, os.path.exists, candidate_index):
+                                static_root = os.path.join(deploy_path, candidate)
+                                break
+                        if not static_root:
+                            await emit(
+                                "[FAIL] No build output with an index.html found "
+                                "(checked dist/, build/, out/)."
+                            )
+                            raise DeployError("Static build output not found.")
+                        await emit(f"[STATIC] Serving from {static_root}.")
 
                     assigned_port: int | None = None
                     if stack == 'node':
@@ -752,11 +848,12 @@ class DeploymentCog(commands.Cog):
 
                     await emit("[NGINX] Writing initial HTTP nginx config...")
 
-                    http_config = (
-                        _nginx_node_http(fqdn, assigned_port)
-                        if stack == 'node'
-                        else _nginx_laravel_http(fqdn, deploy_path)
-                    )
+                    if stack == 'node':
+                        http_config = _nginx_node_http(fqdn, assigned_port)
+                    elif stack == 'static':
+                        http_config = _nginx_static_http(fqdn, static_root)
+                    else:
+                        http_config = _nginx_laravel_http(fqdn, deploy_path)
 
                     def _write_http():
                         with open(nginx_config_path, 'w') as f:
@@ -863,11 +960,12 @@ class DeploymentCog(commands.Cog):
 
                     await emit("[NGINX] Writing full SSL nginx config...")
 
-                    ssl_config = (
-                        _nginx_node_ssl(fqdn, assigned_port)
-                        if stack == 'node'
-                        else _nginx_laravel_ssl(fqdn, deploy_path)
-                    )
+                    if stack == 'node':
+                        ssl_config = _nginx_node_ssl(fqdn, assigned_port)
+                    elif stack == 'static':
+                        ssl_config = _nginx_static_ssl(fqdn, static_root)
+                    else:
+                        ssl_config = _nginx_laravel_ssl(fqdn, deploy_path)
 
                     def _write_ssl():
                         with open(nginx_config_path, 'w') as f:
@@ -954,6 +1052,8 @@ class DeploymentCog(commands.Cog):
 
                         cleanup['pm2_name'] = pm2_name
                         await emit(f"[PM2] Process '{pm2_name}' running on port {assigned_port}.")
+                    elif stack == 'static':
+                        await emit("[PM2] Static stack — no process to manage; nginx serves the build output.")
 
                     await emit("[CHECK] Running final verification...")
 
@@ -1311,7 +1411,7 @@ class DeploymentCog(commands.Cog):
         stack       = deployment['tech_stack']
         loop        = asyncio.get_running_loop()
 
-        if stack == 'node':
+        if stack in ('node', 'static'):
             pkg_path = os.path.join(deploy_path, 'package.json')
 
             def _read_node():
@@ -1364,7 +1464,7 @@ class DeploymentCog(commands.Cog):
         stack       = deployment['tech_stack']
         loop        = asyncio.get_running_loop()
 
-        if stack == 'node':
+        if stack in ('node', 'static'):
             if section not in ('dependencies', 'devDependencies'):
                 return False, "Section must be 'dependencies' or 'devDependencies'."
             pkg_path = os.path.join(deploy_path, 'package.json')
@@ -1493,7 +1593,7 @@ class DeploymentCog(commands.Cog):
                                     raise DeployError("Git update failed.")
                     await emit("[REBUILD] Git update complete.")
 
-                    if stack == 'node':
+                    if stack in ('node', 'static'):
                         await emit("[REBUILD] npm install...")
                         async for result in self.run_exec_stream(
                             ['npm', 'install'], cwd=deploy_path
@@ -1532,23 +1632,26 @@ class DeploymentCog(commands.Cog):
                                     await emit(f"[FAIL] Build failed (exit {code}).")
                                     raise DeployError("Build failed.")
 
-                        await emit(f"[REBUILD] Restarting pm2 process '{pm2_name}'...")
-                        code, out, err = await self.run_exec(
-                            ['pm2', 'reload', pm2_name], cwd=deploy_path
-                        )
-                        if code != 0:
-                            await emit("[REBUILD] pm2 reload failed, trying pm2 start...")
+                        if stack == 'node':
+                            await emit(f"[REBUILD] Restarting pm2 process '{pm2_name}'...")
                             code, out, err = await self.run_exec(
-                                ['pm2', 'start', 'npm', '--name', pm2_name, '--', 'start'],
-                                cwd=deploy_path,
-                                env_extra={'PORT': str(assigned_port)},
+                                ['pm2', 'reload', pm2_name], cwd=deploy_path
                             )
-                        for line in (out + err).splitlines():
-                            if line.strip():
-                                await emit(f"[PM2] {line.strip()}")
-                        if code != 0:
-                            await emit(f"[FAIL] pm2 failed (exit {code}).")
-                            raise DeployError("pm2 failed.")
+                            if code != 0:
+                                await emit("[REBUILD] pm2 reload failed, trying pm2 start...")
+                                code, out, err = await self.run_exec(
+                                    ['pm2', 'start', 'npm', '--name', pm2_name, '--', 'start'],
+                                    cwd=deploy_path,
+                                    env_extra={'PORT': str(assigned_port)},
+                                )
+                            for line in (out + err).splitlines():
+                                if line.strip():
+                                    await emit(f"[PM2] {line.strip()}")
+                            if code != 0:
+                                await emit(f"[FAIL] pm2 failed (exit {code}).")
+                                raise DeployError("pm2 failed.")
+                        else:
+                            await emit("[REBUILD] Static stack — build output refreshed; no process restart needed.")
 
                     elif stack == 'laravel':
                         await emit("[REBUILD] composer install...")
