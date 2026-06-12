@@ -46,10 +46,20 @@ async def close_db():
         DB_POOL.close()
         await DB_POOL.wait_closed()
 
-async def execute_query(query, params=(), fetch_one=False, fetch_all=False):
+async def execute_query(query, params=(), fetch_one=False, fetch_all=False, raise_on_error=False):
+    """
+    Run a query against the pool.
+
+    By default, errors are logged and swallowed (returns None) — convenient, but it
+    hides *why* a write failed. Callers that need the real reason surfaced (e.g. a
+    deploy record insert hitting a NOT NULL / type / enum constraint) can pass
+    raise_on_error=True to have the underlying DB exception propagate instead.
+    """
     global DB_POOL
     if not DB_POOL:
         logger.error("Database pool is not initialized!")
+        if raise_on_error:
+            raise RuntimeError("Database pool is not initialized")
         return None
 
     try:
@@ -68,9 +78,13 @@ async def execute_query(query, params=(), fetch_one=False, fetch_all=False):
 
     except aiomysql.Error as e:
         logger.error(f"Database Query Error: {e} | Query: {query}")
+        if raise_on_error:
+            raise
         return None
     except Exception as e:
         logger.error(f"Unexpected Error: {e}")
+        if raise_on_error:
+            raise
         return None
 
 async def log_system_resources(cpu, ram_p, ram_rem, ram_tot, disk_p, disk_rem, disk_total, i_used, i_tot, conn):
@@ -91,6 +105,60 @@ async def get_system_resources(limit=10):
 async def get_recent_averages():
     query = "SELECT AVG(cpu), AVG(ram_percent) FROM system_stats WHERE timestamp >= NOW() - INTERVAL 3 MINUTE"
     return await execute_query(query, fetch_one=True)
+
+# =====================================================
+# Alerts (frontend notification feed; Discord is secondary, critical-only)
+# =====================================================
+
+async def create_alert(level, title, message=None, source=None, target=None, is_critical=False):
+    alert_uuid = str(uuid.uuid4())
+    query = """
+        INSERT INTO alerts (alert_uuid, level, source, title, message, target, is_critical)
+        VALUES (%s, %s, %s, %s, %s, %s, %s)
+    """
+    params = (alert_uuid, level, source, title, message, target, int(bool(is_critical)))
+    result = await execute_query(query, params)
+    return alert_uuid if result else None
+
+
+async def get_alerts(limit=50, unacknowledged_only=False, level=None):
+    clauses, params = [], []
+    if unacknowledged_only:
+        clauses.append("acknowledged_at IS NULL")
+    if level:
+        clauses.append("level = %s")
+        params.append(level)
+    where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+    params.append(int(limit))
+    rows = await execute_query(
+        f"SELECT * FROM alerts{where} ORDER BY created_at DESC LIMIT %s",
+        tuple(params), fetch_all=True
+    )
+    return rows or []
+
+
+async def get_unacknowledged_alert_count():
+    row = await execute_query(
+        "SELECT COUNT(*) AS c FROM alerts WHERE acknowledged_at IS NULL", fetch_one=True
+    )
+    return (row or {}).get('c', 0) if row else 0
+
+
+async def acknowledge_alert(alert_uuid):
+    result = await execute_query(
+        "UPDATE alerts SET acknowledged_at = CURRENT_TIMESTAMP "
+        "WHERE alert_uuid = %s AND acknowledged_at IS NULL",
+        (alert_uuid,)
+    )
+    return result is not None
+
+
+async def acknowledge_all_alerts():
+    result = await execute_query(
+        "UPDATE alerts SET acknowledged_at = CURRENT_TIMESTAMP WHERE acknowledged_at IS NULL"
+    )
+    return result is not None
+
 
 async def get_recent_system_resources_with_averages():
     query = """
@@ -127,8 +195,15 @@ async def get_webhook_project_by_uuid(uuid):
 
 async def get_all_webhook_projects():
     return await execute_query(
-        "SELECT * FROM webhook_projects ORDER BY id DESC", 
+        "SELECT * FROM webhook_projects ORDER BY id DESC",
         fetch_all=True
+    )
+
+async def get_webhook_project_by_subdomain(subdomain):
+    return await execute_query(
+        "SELECT * FROM webhook_projects WHERE subdomain = %s ORDER BY id DESC LIMIT 1",
+        (subdomain,),
+        fetch_one=True
     )
 
 async def create_new_webhook_project(name, repo_url, branch, tech_stack, subdomain, cloudflare_id, nginx_port):
@@ -407,24 +482,29 @@ async def delete_database(database_uuid: str, deleted_by: str) -> bool:
 # Database Users (database_users)
 # =====================================================
 
-async def create_database_user(username: str, password_encrypted: str, created_by: str) -> dict | None:
+async def create_database_user(
+    username: str, password_encrypted: str, created_by: str, allowed_hosts: str = '%'
+) -> dict | None:
     """
     Create a new database user record.
+    allowed_hosts is the comma-separated MySQL host(s) the user was actually granted
+    on (e.g. '%' for remote), so later grant/drop/revoke target the same 'user'@'host'.
     Returns a dict with user_uuid on success.
     """
     user_uuid = str(uuid.uuid4())
     query = """
         INSERT INTO database_users
-        (user_uuid, username, password_encrypted, created_by)
-        VALUES (%s, %s, %s, %s)
+        (user_uuid, username, password_encrypted, created_by, allowed_hosts)
+        VALUES (%s, %s, %s, %s, %s)
     """
-    params = (user_uuid, username, password_encrypted, created_by)
+    params = (user_uuid, username, password_encrypted, created_by, allowed_hosts)
     result = await execute_query(query, params)
     if result:
         return {
             "user_uuid": user_uuid,
             "username": username,
-            "created_by": created_by
+            "created_by": created_by,
+            "allowed_hosts": allowed_hosts,
         }
     return None
 
@@ -873,7 +953,9 @@ async def create_deployment(
     """
     params = (deployment_uuid, project_uuid, subdomain, tech_stack, assigned_port,
               deploy_path, env_file_name, deployed_by, branch)
-    result = await execute_query(query, params)
+    # raise_on_error=True so a constraint/type failure surfaces the real DB message
+    # to the deploy log instead of an opaque "Failed to create deployment record".
+    result = await execute_query(query, params, raise_on_error=True)
     if result is None:
         raise Exception("Failed to create deployment record")
     return deployment_uuid
@@ -901,6 +983,48 @@ async def get_deployment_by_subdomain(subdomain: str) -> Optional[dict[str, any]
     return await execute_query(query, (subdomain,), fetch_one=True)
 
 
+async def get_deployment_log_by_run(run_uuid: str) -> Optional[dict[str, any]]:
+    return await execute_query(
+        "SELECT * FROM deployment_logs WHERE run_uuid = %s", (run_uuid,), fetch_one=True
+    )
+
+
+# Statuses that mean a subdomain is genuinely occupied. 'failed' and 'deleted'
+# are explicitly NOT live, so a prior failed/removed deploy never blocks a retry.
+LIVE_DEPLOYMENT_STATUSES = ('active', 'pending', 'unhealthy')
+
+
+async def get_live_deployment_by_subdomain(subdomain: str) -> Optional[dict[str, any]]:
+    """Return a deployment for this subdomain only if one is genuinely live."""
+    placeholders = ", ".join(["%s"] * len(LIVE_DEPLOYMENT_STATUSES))
+    query = (
+        f"SELECT * FROM deployments "
+        f"WHERE subdomain = %s AND status IN ({placeholders}) "
+        f"ORDER BY deployed_at DESC LIMIT 1"
+    )
+    return await execute_query(query, (subdomain, *LIVE_DEPLOYMENT_STATUSES), fetch_one=True)
+
+
+async def get_deployments_by_subdomain(subdomain: str) -> list:
+    """Return every deployment row for a subdomain (any status), newest first."""
+    query = "SELECT * FROM deployments WHERE subdomain = %s ORDER BY deployed_at DESC"
+    rows = await execute_query(query, (subdomain,), fetch_all=True)
+    return rows or []
+
+
+async def get_stale_pending_deployments(max_age_seconds: int) -> list:
+    """
+    Deployments stuck in 'pending' longer than max_age_seconds — i.e. a deploy whose
+    process died before its finally-block ran. Used by startup reconciliation.
+    """
+    query = (
+        "SELECT * FROM deployments "
+        "WHERE status = 'pending' AND deployed_at < (NOW() - INTERVAL %s SECOND)"
+    )
+    rows = await execute_query(query, (max_age_seconds,), fetch_all=True)
+    return rows or []
+
+
 async def get_deployment_by_uuid(deployment_uuid: str) -> Optional[dict[str, any]]:
     query = "SELECT * FROM deployments WHERE deployment_uuid = %s"
     return await execute_query(query, (deployment_uuid,), fetch_one=True)
@@ -910,12 +1034,102 @@ async def get_used_deployment_ports() -> set[int]:
     query = """
         SELECT DISTINCT assigned_port
         FROM deployments
-        WHERE status IN ('pending', 'active')
+        WHERE status IN ('pending', 'active', 'unhealthy')
     """
     rows = await execute_query(query, fetch_all=True)
     if not rows:
         return set()
     return {row['assigned_port'] for row in rows}
+
+
+# =====================================================
+# Managed services (managed_services) — adopted/external sites the control plane
+# monitors and operates but did NOT create via the deploy pipeline.
+# =====================================================
+
+async def create_managed_service(
+    name: str,
+    service_type: str,
+    pm2_name: str = None,
+    systemd_unit: str = None,
+    fqdn: str = None,
+    health_url: str = None,
+    deploy_path: str = None,
+    port: int = None,
+    git_url: str = None,
+    branch: str = None,
+) -> dict | None:
+    service_uuid = str(uuid.uuid4())
+    query = """
+        INSERT INTO managed_services
+        (service_uuid, name, service_type, pm2_name, systemd_unit, fqdn, health_url,
+         deploy_path, port, git_url, branch)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+    """
+    params = (service_uuid, name, service_type, pm2_name, systemd_unit, fqdn, health_url,
+              deploy_path, port, git_url, branch)
+    result = await execute_query(query, params, raise_on_error=True)
+    if result is None:
+        return None
+    return {"service_uuid": service_uuid, "name": name, "service_type": service_type}
+
+
+async def get_managed_service(service_uuid: str = None, name: str = None) -> dict | None:
+    if service_uuid:
+        return await execute_query(
+            "SELECT * FROM managed_services WHERE service_uuid = %s", (service_uuid,), fetch_one=True
+        )
+    if name:
+        return await execute_query(
+            "SELECT * FROM managed_services WHERE name = %s", (name,), fetch_one=True
+        )
+    return None
+
+
+async def get_all_managed_services(enabled_only: bool = False) -> list:
+    query = "SELECT * FROM managed_services"
+    if enabled_only:
+        query += " WHERE enabled = 1"
+    query += " ORDER BY name ASC"
+    rows = await execute_query(query, fetch_all=True)
+    return rows or []
+
+
+async def update_managed_service(service_uuid: str, **kwargs) -> bool:
+    if not kwargs:
+        return True
+    set_clause = ", ".join([f"{key} = %s" for key in kwargs.keys()])
+    query = f"UPDATE managed_services SET {set_clause} WHERE service_uuid = %s"
+    params = list(kwargs.values()) + [service_uuid]
+    result = await execute_query(query, params)
+    return result is not None and result >= 0
+
+
+async def delete_managed_service(service_uuid: str) -> bool:
+    result = await execute_query(
+        "DELETE FROM managed_services WHERE service_uuid = %s", (service_uuid,)
+    )
+    return result is not None
+
+
+async def get_active_deployments() -> list:
+    """Deployments that are live (for the watchdog / server overview)."""
+    rows = await execute_query(
+        "SELECT * FROM deployments WHERE status IN ('active', 'unhealthy') ORDER BY subdomain ASC",
+        fetch_all=True,
+    )
+    return rows or []
+
+
+async def delete_deployment_row(deployment_uuid: str) -> bool:
+    """
+    Hard-delete a deployment row. Required because deployments.subdomain is UNIQUE —
+    a soft-deleted row would permanently block re-deploying that subdomain. Audit
+    history is preserved in deployment_logs (which has no FK to deployments).
+    """
+    query = "DELETE FROM deployments WHERE deployment_uuid = %s"
+    result = await execute_query(query, (deployment_uuid,))
+    return result is not None
 
 
 async def update_deployment(deployment_uuid: str, **kwargs) -> bool:

@@ -3,6 +3,7 @@ from discord.ext import commands, tasks
 import asyncio
 import os
 import json
+from database.db import create_alert
 
 class OutputView(discord.ui.View):
     def __init__(self):
@@ -49,6 +50,34 @@ class OutputCog(commands.Cog):
             embed.set_footer(text=f"Sent from {link}")
             
         await self.message_queue.put((None, embed))
+
+    async def alert(self, level, title, message, fields=None, source=None, target=None, critical=False):
+        """
+        Frontend-first alert. EVERY alert is persisted to the `alerts` table for the
+        dashboard notification feed. Discord is secondary: only `critical=True` alerts are
+        also pushed to the Discord channel(s).
+        """
+        try:
+            await create_alert(level, title, str(message), source=source, target=target, is_critical=critical)
+        except Exception:
+            pass
+
+        if not critical:
+            return
+
+        colors = {
+            'info':     discord.Color.blue(),
+            'success':  discord.Color.green(),
+            'warning':  discord.Color.gold(),
+            'error':    discord.Color.red(),
+            'critical': discord.Color.red(),
+        }
+        await self.send_embed(
+            title=title,
+            description=message,
+            color=colors.get(level, discord.Color.default()),
+            fields=fields,
+        )
 
     async def queue_message(self, message, msg_type="INFO"):
         if not isinstance(message, str):

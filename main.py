@@ -32,7 +32,8 @@ cogs_list = [
     'cogs.merge_cog',
     'cogs.database_cog',
     'cogs.database_schedule_cog',
-    'cogs.election_tokens_cog'
+    'cogs.election_tokens_cog',
+    'cogs.selftest_cog'
 ]
 
 @bot.event

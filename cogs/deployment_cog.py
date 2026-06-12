@@ -2,6 +2,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import shutil
 import uuid as uuid_lib
 from datetime import datetime, timezone
@@ -13,8 +14,12 @@ from discord.ext import commands
 from database.db import (
     create_deployment,
     create_deployment_log,
+    delete_deployment_row,
     get_deployment_by_subdomain,
     get_deployment_by_uuid,
+    get_deployments_by_subdomain,
+    get_live_deployment_by_subdomain,
+    get_stale_pending_deployments,
     get_used_deployment_ports,
     update_deployment,
     update_deployment_log,
@@ -35,7 +40,7 @@ _NGINX_AVAILABLE = '/etc/nginx/sites-available'
 _NGINX_ENABLED   = '/etc/nginx/sites-enabled'
 _DEPLOY_BASE     = '/var/www'
 _CERTBOT_EMAIL   = 'nydus@arvo.team'
-_DOMAIN          = 'arvo.team'
+_DOMAIN          = os.getenv('DEPLOY_DOMAIN', 'arvo.team')
 _SERVER_IP       = os.getenv('SERVER_IP', '')
 _PHP_FPM_SOCKET  = 'unix:/var/run/php/php8.2-fpm.sock'
 _NODE_MEM_MB     = 512
@@ -242,6 +247,10 @@ class DeploymentCog(commands.Cog):
         self._semaphore: asyncio.Semaphore = asyncio.Semaphore(_SEMAPHORE_LIMIT)
         self._project_locks: dict[str, asyncio.Lock] = {}
         self._active_streams: dict[str, asyncio.Queue] = {}
+        # Serializes port scan→reserve across concurrent deploys so two deploys
+        # can't pick the same free port before either has persisted its choice.
+        self._port_lock: asyncio.Lock = asyncio.Lock()
+        self._reconciled: bool = False
 
     async def branch_exists(self, git_url: str, branch: str, pat: str = "") -> bool:
         """Check if a branch exists in the remote repository."""
@@ -395,8 +404,474 @@ class DeploymentCog(commands.Cog):
                 return code, out, err
         return last_code, '\n'.join(out_parts), '\n'.join(err_parts)
 
+    async def _pm2_status(self, name: str) -> dict | None:
+        """Return the pm2 process info dict for `name` from `pm2 jlist`, or None."""
+        code, out, _ = await self.run_exec(['pm2', 'jlist'], timeout=30)
+        if code != 0 or not out.strip():
+            return None
+        try:
+            procs = json.loads(out)
+        except (ValueError, TypeError):
+            return None
+        for proc in procs:
+            if proc.get('name') == name:
+                return proc
+        return None
+
+    async def _pm2_is_online(
+        self, name: str, checks: int = 3, delay: float = 2.0
+    ) -> tuple[bool, str]:
+        """
+        Confirm a pm2 process is genuinely online and not crash-looping.
+
+        `pm2 start`/`pm2 describe` return 0 even when the app immediately exits,
+        so we poll `pm2 jlist` several times: the process must report
+        status == 'online' on every poll and its restart counter must not climb.
+        Returns (ok, human-readable detail).
+        """
+        first_restarts: int | None = None
+        detail = "no pm2 data"
+        for attempt in range(checks):
+            proc = await self._pm2_status(name)
+            if not proc:
+                return False, "process not found in pm2 jlist"
+            env = proc.get('pm2_env', {}) or {}
+            status = env.get('status')
+            restarts = env.get('restart_time', 0)
+            detail = f"status={status}, restarts={restarts}"
+            if status != 'online':
+                return False, detail
+            if first_restarts is None:
+                first_restarts = restarts
+            elif restarts > first_restarts:
+                return False, f"crash-looping (restarts {first_restarts}->{restarts})"
+            if attempt < checks - 1:
+                await asyncio.sleep(delay)
+        return True, detail
+
+    async def _http_port_ok(
+        self, port: int, attempts: int = 5, delay: float = 2.0
+    ) -> bool:
+        """Poll http://127.0.0.1:port until it answers; any HTTP response means it's listening."""
+        url = f"http://127.0.0.1:{port}"
+        for attempt in range(attempts):
+            try:
+                async with aiohttp.ClientSession() as session:
+                    async with session.get(
+                        url, timeout=aiohttp.ClientTimeout(total=5)
+                    ) as resp:
+                        # Any status (even 404/500) proves the process is bound and serving.
+                        _ = resp.status
+                        return True
+            except Exception:
+                pass
+            if attempt < attempts - 1:
+                await asyncio.sleep(delay)
+        return False
+
     def get_stream(self, run_id: str):
         return self._active_streams.get(run_id)
+
+    async def _http_health_check(self, fqdn: str, emit, attempts: int = 5) -> bool:
+        """Poll https://fqdn up to `attempts` times; True once it returns HTTP 200.
+
+        TLS verification is disabled (`ssl=False`): this check only answers "is the
+        site serving a 200", not "is the cert trusted" (cert validity is reported
+        separately via `_ssl_days_left`). Disabling it keeps the check correct when
+        the origin presents a Let's Encrypt *staging* cert (self-test) or a freshly
+        renewed chain a client hasn't picked up yet, instead of failing falsely.
+        """
+        for attempt in range(attempts):
+            try:
+                async with aiohttp.ClientSession() as session:
+                    async with session.get(
+                        f"https://{fqdn}", timeout=aiohttp.ClientTimeout(total=10),
+                        ssl=False,
+                    ) as resp:
+                        await emit(f"[HEALTH] HTTP {resp.status} (attempt {attempt+1}/{attempts}).")
+                        if resp.status == 200:
+                            return True
+            except Exception as e:
+                await emit(f"[HEALTH] Error: {e} (attempt {attempt+1}/{attempts}).")
+            if attempt < attempts - 1:
+                await asyncio.sleep(3)
+        return False
+
+    async def _revert_to_commit(self, deploy_path, stack, pm2_name, assigned_port, sha, emit) -> bool:
+        """Hard-reset to `sha` and rebuild — used to roll back a failed rebuild."""
+        code, _, err = await self.run_exec(['git', 'reset', '--hard', sha], cwd=deploy_path)
+        if code != 0:
+            await emit(f"[ROLLBACK] git reset failed: {err.strip()}")
+            return False
+        if stack in ('node', 'static'):
+            code, _, err = await self.run_exec(['npm', 'install'], cwd=deploy_path)
+            if code != 0:
+                await emit("[ROLLBACK] npm install failed.")
+                return False
+            code, _, err = await self.run_exec(
+                ['npm', 'run', 'build'], cwd=deploy_path,
+                env_extra={'NODE_OPTIONS': f'--max-old-space-size={_NODE_MEM_MB}'},
+            )
+            if code != 0:
+                await emit("[ROLLBACK] npm build failed.")
+                return False
+        elif stack == 'laravel':
+            code, _, _ = await self.run_exec(
+                ['composer', 'install', '--no-dev', '--optimize-autoloader'], cwd=deploy_path
+            )
+            if code != 0:
+                await emit("[ROLLBACK] composer install failed.")
+                return False
+            for artisan_cmd in (['php', 'artisan', 'config:cache'],
+                                ['php', 'artisan', 'route:cache'],
+                                ['php', 'artisan', 'view:cache']):
+                await self.run_exec(artisan_cmd, cwd=deploy_path)
+        if stack == 'node':
+            code, _, _ = await self.run_exec(['pm2', 'reload', pm2_name], cwd=deploy_path)
+            if code != 0:
+                code, _, err = await self.run_exec(
+                    ['pm2', 'start', 'npm', '--name', pm2_name, '--', 'start'],
+                    cwd=deploy_path, env_extra={'PORT': str(assigned_port)},
+                )
+                if code != 0:
+                    await emit("[ROLLBACK] pm2 reload/start failed.")
+                    return False
+        return True
+
+    async def _notify(self, level: str, title: str, message: str, fields: dict | None = None,
+                      critical: bool = False, target: str | None = None, source: str = 'deploy'):
+        """Record an alert (frontend feed); Discord only when critical=True. Never raises."""
+        output = self.bot.get_cog('OutputCog')
+        if not output:
+            return
+        try:
+            await output.alert(level, title, message, fields=fields,
+                               source=source, target=target, critical=critical)
+        except Exception:
+            self.logger.debug("OutputCog alert failed", exc_info=True)
+
+    # ===========================================================================
+    # Control plane: per-deployment status aggregation, control actions, discovery
+    # ===========================================================================
+
+    async def _ssl_days_left(self, fqdn: str) -> int | None:
+        """Days until the cert for fqdn expires (via certbot), or None if unknown."""
+        code, out, _ = await self.run_exec(
+            ['sudo', 'certbot', 'certificates', '-d', fqdn], timeout=30
+        )
+        if code != 0:
+            return None
+        m = re.search(r'VALID:\s*(\d+)\s*day', out)
+        return int(m.group(1)) if m else None
+
+    async def _dns_state(self, subdomain: str) -> dict:
+        """Cloudflare A-record state for subdomain vs the expected SERVER_IP."""
+        fqdn = f"{subdomain}.{_DOMAIN}"
+        cf = self.bot.get_cog('CloudflareCog')
+        if not cf:
+            return {'present': False, 'content': None, 'proxied': None, 'drift': True}
+        try:
+            data, _ = await cf.list_dns_records(type='A', name=fqdn)
+        except Exception:
+            return {'present': False, 'content': None, 'proxied': None, 'drift': True}
+        rec = (data or [None])[0]
+        if not rec:
+            return {'present': False, 'content': None, 'proxied': None, 'drift': True}
+        content = rec.get('content')
+        return {
+            'present': True,
+            'content': content,
+            'proxied': rec.get('proxied'),
+            'drift': content != _SERVER_IP,
+        }
+
+    async def _http_health(self, fqdn: str) -> dict:
+        try:
+            async with aiohttp.ClientSession() as s:
+                async with s.get(
+                    f"https://{fqdn}", timeout=aiohttp.ClientTimeout(total=8)
+                ) as r:
+                    return {'ok': r.status == 200, 'code': r.status}
+        except Exception as e:
+            return {'ok': False, 'code': None, 'error': str(e)}
+
+    async def get_deployment_status(self, deployment: dict) -> dict:
+        """Aggregate live status for a deployment (pm2/http/ssl/dns/disk)."""
+        subdomain = deployment.get('subdomain')
+        fqdn = f"{subdomain}.{_DOMAIN}"
+        stack = deployment.get('tech_stack')
+        pm2_name = deployment.get('pm2_name') or (deployment.get('deployment_uuid') or '')[:12]
+
+        pm2_info = None
+        if stack == 'node':
+            proc = await self._pm2_status(pm2_name)
+            if proc:
+                env = proc.get('pm2_env', {}) or {}
+                monit = proc.get('monit', {}) or {}
+                pm2_info = {
+                    'status': env.get('status'),
+                    'restarts': env.get('restart_time', 0),
+                    'uptime': env.get('pm_uptime'),
+                    'cpu': monit.get('cpu'),
+                    'memory': monit.get('memory'),
+                }
+
+        disk_bytes = None
+        dp = deployment.get('deploy_path')
+        if dp:
+            # `du -sb` is far cheaper than a Python os.walk over node_modules.
+            code, out, _ = await self.run_exec(['du', '-sb', dp], timeout=30)
+            if code == 0:
+                try:
+                    disk_bytes = int(out.split()[0])
+                except (ValueError, IndexError):
+                    disk_bytes = None
+
+        return {
+            'deployment_uuid': deployment.get('deployment_uuid'),
+            'subdomain': subdomain,
+            'fqdn': fqdn,
+            'stack': stack,
+            'status': deployment.get('status'),
+            'pm2': pm2_info,
+            'http': await self._http_health(fqdn),
+            'ssl': {'days_left': await self._ssl_days_left(fqdn)},
+            'dns': await self._dns_state(subdomain),
+            'disk_bytes': disk_bytes,
+            'assigned_port': deployment.get('assigned_port'),
+            'deployed_at': deployment.get('deployed_at'),
+            'deployed_by': deployment.get('deployed_by'),
+        }
+
+    async def control_process(self, pm2_name: str, action: str) -> tuple[bool, str]:
+        """pm2 lifecycle control for a process by name."""
+        if action not in ('start', 'stop', 'restart', 'reload', 'flush'):
+            return False, f"Invalid action '{action}'"
+        cmd = ['pm2', 'flush', pm2_name] if action == 'flush' else ['pm2', action, pm2_name]
+        code, out, err = await self.run_exec(cmd, timeout=60)
+        if code != 0:
+            return False, (err or out or 'pm2 command failed').strip()
+        await self._notify('info', f"Process {action}", f"`{pm2_name}` {action} via control plane.",
+                           source='control', target=pm2_name)
+        return True, (out or '').strip()
+
+    async def control_nginx(self, action: str, fqdn: str = None) -> tuple[bool, str]:
+        """nginx control: test / reload / enable|disable a site."""
+        if action == 'test':
+            code, out, err = await self.run_exec(['sudo', 'nginx', '-t'], timeout=30)
+            return code == 0, (out + err).strip()
+        if action == 'reload':
+            code, _, err = await self.run_exec(['sudo', 'systemctl', 'reload', 'nginx'], timeout=30)
+            return code == 0, ('' if code == 0 else err.strip())
+        if action in ('enable', 'disable') and fqdn:
+            avail = os.path.join(_NGINX_AVAILABLE, fqdn)
+            link = os.path.join(_NGINX_ENABLED, fqdn)
+            loop = asyncio.get_running_loop()
+
+            def _toggle():
+                try:
+                    if action == 'enable' and not os.path.islink(link):
+                        os.symlink(avail, link)
+                    elif action == 'disable' and os.path.islink(link):
+                        os.remove(link)
+                    return True
+                except OSError:
+                    return False
+            if not await loop.run_in_executor(None, _toggle):
+                return False, "symlink toggle failed"
+            # Validate before reloading; never leave nginx in a broken state.
+            code, _, err = await self.run_exec(['sudo', 'nginx', '-t'], timeout=30)
+            if code != 0:
+                return False, f"nginx -t failed after {action}: {err.strip()}"
+            code, _, err = await self.run_exec(['sudo', 'systemctl', 'reload', 'nginx'], timeout=30)
+            return code == 0, ('' if code == 0 else err.strip())
+        return False, f"Invalid nginx action '{action}'"
+
+    async def renew_ssl(self, fqdn: str) -> tuple[bool, str]:
+        code, out, err = await self.run_exec(
+            ['sudo', 'certbot', 'renew', '--cert-name', fqdn, '--non-interactive'], timeout=180
+        )
+        if code != 0:
+            return False, (err or out).strip()
+        await self.run_exec(['sudo', 'systemctl', 'reload', 'nginx'], timeout=30)
+        await self._notify('info', 'SSL renewed', f"Cert for `{fqdn}` renewed.",
+                           source='control', target=fqdn)
+        return True, (out or '').strip()
+
+    async def reconcile_dns(self, subdomain: str) -> tuple[bool, str]:
+        """Force the Cloudflare A record back to the correct IP + proxied state."""
+        cf = self.bot.get_cog('CloudflareCog')
+        if not cf:
+            return False, "CloudflareCog unavailable"
+        fqdn = f"{subdomain}.{_DOMAIN}"
+        try:
+            data, _ = await cf.list_dns_records(type='A', name=fqdn)
+        except Exception as e:
+            return False, str(e)
+        rec = (data or [None])[0]
+        if rec:
+            _, err = await cf.update_dns_record(
+                record_id=rec['id'], type='A', name=subdomain, content=_SERVER_IP,
+                ttl=1, proxied=True, comment="nydus | dns reconcile",
+            )
+        else:
+            _, err = await cf.create_dns_record(
+                type='A', name=subdomain, content=_SERVER_IP, ttl=1, proxied=True,
+                comment="nydus | dns reconcile",
+            )
+        if err:
+            return False, err
+        await self._notify('info', 'DNS reconciled', f"`{fqdn}` → {_SERVER_IP} (proxied).",
+                           source='control', target=fqdn)
+        return True, "ok"
+
+    async def discover_server_state(self) -> dict:
+        """Enumerate live server reality (pm2 processes, nginx sites, certs) for adoption/drift."""
+        result = {'pm2': [], 'nginx_sites': [], 'certs': []}
+
+        code, out, _ = await self.run_exec(['pm2', 'jlist'], timeout=30)
+        if code == 0 and out.strip():
+            try:
+                for p in json.loads(out):
+                    env = p.get('pm2_env', {}) or {}
+                    result['pm2'].append({
+                        'name': p.get('name'),
+                        'status': env.get('status'),
+                        'cwd': env.get('pm_cwd'),
+                        'restarts': env.get('restart_time', 0),
+                    })
+            except (ValueError, TypeError):
+                pass
+
+        loop = asyncio.get_running_loop()
+
+        def _scan_sites():
+            sites = []
+            try:
+                for fn in os.listdir(_NGINX_AVAILABLE):
+                    path = os.path.join(_NGINX_AVAILABLE, fn)
+                    if not os.path.isfile(path):
+                        continue
+                    try:
+                        with open(path, 'r', errors='replace') as f:
+                            content = f.read()
+                    except OSError:
+                        continue
+                    names = re.findall(r'server_name\s+([^;]+);', content)
+                    ports = re.findall(r'proxy_pass\s+http://localhost:(\d+)', content)
+                    roots = re.findall(r'\broot\s+([^;]+);', content)
+                    sites.append({
+                        'file': fn,
+                        'server_names': [s.strip() for nm in names for s in nm.split()],
+                        'ports': [int(p) for p in ports],
+                        'roots': [r.strip() for r in roots],
+                        'enabled': os.path.islink(os.path.join(_NGINX_ENABLED, fn)),
+                    })
+            except Exception:
+                pass
+            return sites
+        result['nginx_sites'] = await loop.run_in_executor(None, _scan_sites)
+
+        code, out, _ = await self.run_exec(['sudo', 'certbot', 'certificates'], timeout=30)
+        if code == 0:
+            for block in out.split('Certificate Name:')[1:]:
+                name_m = re.match(r'\s*(\S+)', block)
+                domains_m = re.search(r'Domains:\s*(.+)', block)
+                days_m = re.search(r'VALID:\s*(\d+)\s*day', block)
+                if name_m and domains_m:
+                    result['certs'].append({
+                        'name': name_m.group(1),
+                        'domains': domains_m.group(1).split(),
+                        'days_left': int(days_m.group(1)) if days_m else None,
+                    })
+        return result
+
+    # --- Bulk snapshots: one subprocess/API call each, for the server overview + watchdog ---
+
+    async def _pm2_jlist_map(self) -> dict:
+        """{process_name: proc} from a single `pm2 jlist` (avoids per-target jlist calls)."""
+        code, out, _ = await self.run_exec(['pm2', 'jlist'], timeout=30)
+        result = {}
+        if code == 0 and out.strip():
+            try:
+                for p in json.loads(out):
+                    if p.get('name'):
+                        result[p['name']] = p
+            except (ValueError, TypeError):
+                pass
+        return result
+
+    async def _all_certs_map(self) -> dict:
+        """{domain: days_left} from a single `certbot certificates` (avoids per-fqdn calls + lock contention)."""
+        code, out, _ = await self.run_exec(['sudo', 'certbot', 'certificates'], timeout=30)
+        certs = {}
+        if code == 0:
+            for block in out.split('Certificate Name:')[1:]:
+                domains_m = re.search(r'Domains:\s*(.+)', block)
+                days_m = re.search(r'VALID:\s*(\d+)\s*day', block)
+                days = int(days_m.group(1)) if days_m else None
+                if domains_m:
+                    for dom in domains_m.group(1).split():
+                        certs[dom] = days
+        return certs
+
+    async def _all_dns_a_map(self) -> dict:
+        """{record_name: record} for A records (first page) from one Cloudflare call."""
+        cf = self.bot.get_cog('CloudflareCog')
+        if not cf:
+            return {}
+        try:
+            data, _ = await cf.list_dns_records(type='A')
+        except Exception:
+            return {}
+        return {r.get('name'): r for r in (data or []) if r.get('name')}
+
+    async def build_overview(self, deployments: list) -> list:
+        """
+        Lightweight per-deployment status for the server overview: one pm2/cert/DNS
+        snapshot shared across all deployments, plus a bounded-concurrency HTTP check.
+        Heavy per-deployment certbot/disk stays on get_deployment_status (single-row).
+        """
+        pm2_map = await self._pm2_jlist_map()
+        cert_map = await self._all_certs_map()
+        dns_map = await self._all_dns_a_map()
+        sem = asyncio.Semaphore(8)
+
+        async def _one(d):
+            subdomain = d.get('subdomain')
+            fqdn = f"{subdomain}.{_DOMAIN}"
+            stack = d.get('tech_stack')
+            pm2_name = d.get('pm2_name') or (d.get('deployment_uuid') or '')[:12]
+            pm2_info = None
+            if stack == 'node':
+                proc = pm2_map.get(pm2_name)
+                if proc:
+                    env = proc.get('pm2_env', {}) or {}
+                    monit = proc.get('monit', {}) or {}
+                    pm2_info = {
+                        'status': env.get('status'),
+                        'restarts': env.get('restart_time', 0),
+                        'cpu': monit.get('cpu'),
+                        'memory': monit.get('memory'),
+                    }
+            async with sem:
+                http = await self._http_health(fqdn)
+            rec = dns_map.get(fqdn)
+            dns = {
+                'present': bool(rec),
+                'content': rec.get('content') if rec else None,
+                'proxied': rec.get('proxied') if rec else None,
+                'drift': (not rec) or rec.get('content') != _SERVER_IP,
+            }
+            return {
+                'deployment_uuid': d.get('deployment_uuid'),
+                'subdomain': subdomain, 'fqdn': fqdn, 'stack': stack,
+                'status': d.get('status'), 'pm2': pm2_info, 'http': http,
+                'ssl': {'days_left': cert_map.get(fqdn)}, 'dns': dns,
+                'assigned_port': d.get('assigned_port'),
+                'deployed_at': d.get('deployed_at'), 'deployed_by': d.get('deployed_by'),
+            }
+        return list(await asyncio.gather(*[_one(d) for d in deployments]))
 
     def queue_deploy(
         self,
@@ -404,11 +879,12 @@ class DeploymentCog(commands.Cog):
         subdomain: str,
         pat: str,
         triggered_by: str,
+        cert_staging: bool = False,
     ) -> str:
         run_id = str(uuid_lib.uuid4())
         self._active_streams[run_id] = asyncio.Queue()
         asyncio.create_task(
-            self._run_and_cleanup(run_id, project_data, subdomain, pat, triggered_by)
+            self._run_and_cleanup(run_id, project_data, subdomain, pat, triggered_by, cert_staging)
         )
         return run_id
 
@@ -419,9 +895,10 @@ class DeploymentCog(commands.Cog):
         subdomain: str,
         pat: str,
         triggered_by: str,
+        cert_staging: bool = False,
     ):
         try:
-            await self.deploy_project(run_id, project_data, subdomain, pat, triggered_by)
+            await self.deploy_project(run_id, project_data, subdomain, pat, triggered_by, cert_staging)
         except Exception as e:
             self.logger.exception(f"Unhandled deploy error [{run_id}]: {e}")
             q = self._active_streams.get(run_id)
@@ -457,6 +934,7 @@ class DeploymentCog(commands.Cog):
         subdomain: str,
         pat: str,
         triggered_by: str,
+        cert_staging: bool = False,
     ):
         log_lines: list[str] = []
         loop = asyncio.get_running_loop()
@@ -476,6 +954,7 @@ class DeploymentCog(commands.Cog):
             'nginx_symlink': None,
             'cf_record_id':  None,
             'pm2_name':      None,
+            'cert_name':     None,
             'deployment_uuid': None,
         }
 
@@ -522,10 +1001,18 @@ class DeploymentCog(commands.Cog):
                         await emit("[FAIL] SERVER_IP is not configured.")
                         raise DeployError("SERVER_IP not set.")
 
-                    existing = await get_deployment_by_subdomain(subdomain)
-                    if existing:
-                        await emit(f"[FAIL] Subdomain '{subdomain}' is already active.")
+                    live = await get_live_deployment_by_subdomain(subdomain)
+                    if live:
+                        await emit(
+                            f"[FAIL] Subdomain '{subdomain}' is already in use by a live "
+                            f"deployment (status: {live['status']}). Use rebuild instead."
+                        )
                         raise DeployError("Subdomain already in use.")
+
+                    # No live owner: clear any remnants from a prior failed/deleted/crashed
+                    # deploy so this attempt starts clean (prevents the "already in use"
+                    # blocker, duplicate Cloudflare records, and leaked ports).
+                    await self._reclaim_subdomain(subdomain, run_id, log_lines, pat)
 
                     await emit("[CHECK] Pre-flight passed.")
 
@@ -787,10 +1274,24 @@ class DeploymentCog(commands.Cog):
                             raise DeployError("Static build output not found.")
                         await emit(f"[STATIC] Serving from {static_root}.")
 
+                    # Create the deployment record first (port still unassigned). For node we
+                    # then pick a port and persist it while holding _port_lock, so the
+                    # scan→reserve window is atomic and concurrent deploys can't collide.
+                    await emit("[DB] Saving deployment record...")
+                    deployment_uuid = await create_deployment(
+                        project_uuid=project_uuid,
+                        subdomain=subdomain,
+                        tech_stack=stack,
+                        assigned_port=None,
+                        deploy_path=deploy_path,
+                        env_file_name=env_file_name,
+                        deployed_by=triggered_by,
+                        branch=branch,
+                    )
+                    cleanup['deployment_uuid'] = deployment_uuid
+
                     assigned_port: int | None = None
                     if stack == 'node':
-                        await emit("[PORT] Scanning for an available port...")
-                        
                         # Manually check nginx config files one by one (except default)
                         def _scan_nginx_ports():
                             ports = set()
@@ -808,35 +1309,25 @@ class DeploymentCog(commands.Cog):
                                             if 'proxy_pass http://localhost:' in line:
                                                 try:
                                                     port_str = line.split('localhost:')[1].split(';')[0].split('/')[0].strip()
-                                                    port = int(port_str)
-                                                    ports.add(port)
+                                                    ports.add(int(port_str))
                                                 except (ValueError, IndexError):
                                                     pass
                             except Exception:
                                 pass
                             return ports
-                        
-                        nginx_ports = await loop.run_in_executor(None, _scan_nginx_ports)
-                        db_ports      = await get_used_deployment_ports()
-                        used_ports    = nginx_ports | db_ports
-                        assigned_port = assign_free_port(used_ports, _PORT_MIN, _PORT_MAX)
-                        if assigned_port is None:
-                            await emit(f"[FAIL] No ports available in range {_PORT_MIN}-{_PORT_MAX}.")
-                            raise DeployError("Port exhaustion.")
-                        await emit(f"[PORT] Assigned port {assigned_port}.")
 
-                    await emit("[DB] Saving deployment record...")
-                    deployment_uuid = await create_deployment(
-                        project_uuid=project_uuid,
-                        subdomain=subdomain,
-                        tech_stack=stack,
-                        assigned_port=assigned_port,
-                        deploy_path=deploy_path,
-                        env_file_name=env_file_name,
-                        deployed_by=triggered_by,
-                        branch=branch,
-                    )
-                    cleanup['deployment_uuid'] = deployment_uuid
+                        async with self._port_lock:
+                            await emit("[PORT] Scanning for an available port...")
+                            nginx_ports = await loop.run_in_executor(None, _scan_nginx_ports)
+                            db_ports    = await get_used_deployment_ports()
+                            used_ports  = nginx_ports | db_ports
+                            assigned_port = assign_free_port(used_ports, _PORT_MIN, _PORT_MAX)
+                            if assigned_port is None:
+                                await emit(f"[FAIL] No ports available in range {_PORT_MIN}-{_PORT_MAX}.")
+                                raise DeployError("Port exhaustion.")
+                            # Persist immediately so a concurrent deploy's scan sees this port taken.
+                            await update_deployment(deployment_uuid, assigned_port=assigned_port)
+                        await emit(f"[PORT] Assigned port {assigned_port}.")
 
                     await create_deployment_log(
                         run_uuid=run_id,
@@ -939,23 +1430,25 @@ class DeploymentCog(commands.Cog):
                             "Proceeding anyway; certbot may fail."
                         )
 
-                    await emit(f"[SSL] Obtaining Let's Encrypt certificate for {fqdn}...")
-                    code, out, err = await self.run_exec(
-                        [
-                            'sudo', 'certbot', 'certonly', '--nginx',
-                            '-d', fqdn,
-                            '--non-interactive',
-                            '--agree-tos',
-                            '-m', _CERTBOT_EMAIL,
-                        ],
-                        timeout=180,
-                    )
+                    staging_note = " (staging)" if cert_staging else ""
+                    await emit(f"[SSL] Obtaining Let's Encrypt certificate for {fqdn}{staging_note}...")
+                    certbot_cmd = [
+                        'sudo', 'certbot', 'certonly', '--nginx',
+                        '-d', fqdn,
+                        '--non-interactive',
+                        '--agree-tos',
+                        '-m', _CERTBOT_EMAIL,
+                    ]
+                    if cert_staging:
+                        certbot_cmd.append('--staging')
+                    code, out, err = await self.run_exec(certbot_cmd, timeout=180)
                     for line in (out + err).splitlines():
                         if line.strip():
                             await emit(f"[SSL] {line.strip()}")
                     if code != 0:
                         await emit(f"[FAIL] certbot failed (exit {code}).")
                         raise DeployError("certbot SSL provisioning failed.")
+                    cleanup['cert_name'] = fqdn
                     await emit(f"[SSL] Certificate obtained for {fqdn}.")
 
                     await emit("[NGINX] Writing full SSL nginx config...")
@@ -1011,6 +1504,9 @@ class DeploymentCog(commands.Cog):
                     pm2_name = deployment_uuid[:12]
                     if stack == 'node':
                         await emit(f"[PM2] Starting process '{pm2_name}' on port {assigned_port}...")
+                        # Track the process for rollback as soon as we attempt to start it,
+                        # so a later health failure tears it down instead of leaking it.
+                        cleanup['pm2_name'] = pm2_name
 
                         code_desc, _, _ = await self.run_exec(['pm2', 'describe', pm2_name])
                         if code_desc == 0:
@@ -1050,8 +1546,22 @@ class DeploymentCog(commands.Cog):
                                         await emit(f"[FAIL] pm2 start failed (exit {code}).")
                                         raise DeployError("pm2 start failed.")
 
-                        cleanup['pm2_name'] = pm2_name
-                        await emit(f"[PM2] Process '{pm2_name}' running on port {assigned_port}.")
+                        await emit(f"[PM2] Process '{pm2_name}' started; verifying it stays online...")
+                        online, detail = await self._pm2_is_online(pm2_name)
+                        if not online:
+                            await emit(
+                                f"[FAIL] pm2 process '{pm2_name}' is not healthy ({detail}). "
+                                "The app likely crashed on startup (e.g. missing 'start' script "
+                                "or a runtime error)."
+                            )
+                            raise DeployError(f"pm2 process not healthy: {detail}")
+                        if not await self._http_port_ok(assigned_port):
+                            await emit(
+                                f"[FAIL] App is not responding on 127.0.0.1:{assigned_port}; "
+                                "it did not bind the assigned port."
+                            )
+                            raise DeployError("App did not bind its assigned port.")
+                        await emit(f"[PM2] Process '{pm2_name}' confirmed online on port {assigned_port}.")
                     elif stack == 'static':
                         await emit("[PM2] Static stack — no process to manage; nginx serves the build output.")
 
@@ -1071,18 +1581,32 @@ class DeploymentCog(commands.Cog):
                         await emit("[WARN] nginx -t returned non-zero on final check.")
 
                     if stack == 'node':
-                        code, _, _ = await self.run_exec(['pm2', 'describe', pm2_name])
-                        if code == 0:
-                            await emit(f"[CHECK] pm2 process '{pm2_name}' confirmed running.")
+                        online, detail = await self._pm2_is_online(pm2_name, checks=1)
+                        if online:
+                            await emit(f"[CHECK] pm2 process '{pm2_name}' confirmed online.")
                         else:
-                            await emit(f"[WARN] pm2 process '{pm2_name}' not confirmed.")
+                            await emit(f"[WARN] pm2 process '{pm2_name}' not online ({detail}).")
 
                     await emit("[HEALTH] Performing HTTP health check...")
                     health_ok = False
                     for attempt in range(5):
                         try:
-                            async with aiohttp.ClientSession() as session:
-                                async with session.get(f"https://{fqdn}", timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                            if cert_staging:
+                                # Staging cert is untrusted and Cloudflare would reject/serve it
+                                # inconsistently — hit the origin directly (127.0.0.1 + Host header,
+                                # TLS verification off) so the check reflects the real stack.
+                                session_ctx = aiohttp.ClientSession(
+                                    connector=aiohttp.TCPConnector(ssl=False)
+                                )
+                                url, headers = "https://127.0.0.1/", {'Host': fqdn}
+                            else:
+                                session_ctx = aiohttp.ClientSession()
+                                url, headers = f"https://{fqdn}", {}
+                            async with session_ctx as session:
+                                async with session.get(
+                                    url, headers=headers,
+                                    timeout=aiohttp.ClientTimeout(total=10)
+                                ) as resp:
                                     if resp.status == 200:
                                         health_ok = True
                                         await emit(f"[HEALTH] Site responded with HTTP {resp.status} (attempt {attempt+1}/5).")
@@ -1093,28 +1617,57 @@ class DeploymentCog(commands.Cog):
                             await emit(f"[HEALTH] Error: {e} (attempt {attempt+1}/5).")
                         if attempt < 4:
                             await asyncio.sleep(3)
-                    if health_ok:
-                        await emit("[HEALTH] Health check passed.")
-                    else:
-                        await emit("[HEALTH] Health check failed. Site may be unreachable.")
-                        await update_deployment(deployment_uuid, status='unhealthy')
-
+                    # The deploy pipeline completed (nginx/SSL/DNS/process all succeeded), so the
+                    # site is live and must NOT be rolled back — but the HTTP health result is
+                    # recorded durably as the deployment status instead of being overwritten.
+                    final_status = 'active' if health_ok else 'unhealthy'
                     await update_deployment(
                         deployment_uuid,
-                        status='active',
+                        status=final_status,
                         deployed_at=datetime.now(timezone.utc),
                     )
                     success = True
-                    await emit(f"[DONE] Deployment complete. Live at: https://{fqdn}")
+                    if health_ok:
+                        await emit("[HEALTH] Health check passed.")
+                        await emit(f"[DONE] Deployment complete. Live at: https://{fqdn}")
+                        await self._notify(
+                            'success', 'Deployment complete',
+                            f"`{fqdn}` is live.", target=fqdn,
+                            fields={'Stack': stack, 'Run': run_id, 'By': triggered_by},
+                        )
+                    else:
+                        await emit(
+                            "[HEALTH] Health check failed — site is live but not returning HTTP 200. "
+                            "Marked 'unhealthy'."
+                        )
+                        await emit(f"[DONE] Deployment finished (UNHEALTHY): https://{fqdn}")
+                        await self._notify(
+                            'warning', 'Deployment unhealthy',
+                            f"`{fqdn}` deployed but is not returning HTTP 200.",
+                            critical=True, target=fqdn,
+                            fields={'Stack': stack, 'Run': run_id, 'By': triggered_by},
+                        )
 
                 except DeployError as e:
                     await emit(f"[FAIL] {e}")
                     await self._cleanup_failed_deploy(cleanup, run_id, log_lines, pat, stack)
+                    await self._notify(
+                        'error', 'Deployment failed',
+                        f"`{fqdn}` failed and was rolled back: {e}",
+                        critical=True, target=fqdn,
+                        fields={'Stack': stack or 'unknown', 'Run': run_id, 'By': triggered_by},
+                    )
 
                 except Exception as e:
                     self.logger.exception(f"Unexpected deploy error [{run_id}]: {e}")
                     await emit(f"[FATAL] Unexpected error: {e}")
                     await self._cleanup_failed_deploy(cleanup, run_id, log_lines, pat, stack)
+                    await self._notify(
+                        'error', 'Deployment error',
+                        f"`{fqdn}` hit an unexpected error and was rolled back: {e}",
+                        critical=True, target=fqdn,
+                        fields={'Stack': stack or 'unknown', 'Run': run_id, 'By': triggered_by},
+                    )
 
                 finally:
                     full_log = '\n'.join(log_lines)
@@ -1134,6 +1687,138 @@ class DeploymentCog(commands.Cog):
                             f"Deploy run {run_id} ended without a deployment_uuid. "
                             f"Partial log: {full_log[:500]}"
                         )
+
+    @commands.Cog.listener()
+    async def on_ready(self):
+        # Run crash-recovery reconciliation once, after the bot connects.
+        if self._reconciled:
+            return
+        self._reconciled = True
+        await self._reconcile_stale_deploys()
+
+    async def _reconcile_stale_deploys(self):
+        """
+        Fail deployments stuck in 'pending' past the deploy timeout — these are crashed
+        deploys whose finally-block never ran. Marking them failed frees their port and
+        unblocks their subdomain; the next deploy's reclaim clears external remnants.
+        """
+        try:
+            stale = await get_stale_pending_deployments(_DEPLOY_TIMEOUT)
+        except Exception as e:
+            self.logger.error(f"Reconciliation query failed: {e}")
+            return
+        for d in stale:
+            try:
+                # Kill any process the crashed deploy may have left running, so it doesn't
+                # keep holding its port after the row is freed (the port scan can't see it).
+                name = d.get('pm2_name') or (d.get('deployment_uuid') or '')[:12]
+                if name:
+                    await self.run_exec(['pm2', 'delete', name])
+                await update_deployment(d['deployment_uuid'], status='failed')
+                self.logger.warning(
+                    f"Reconciliation: marked stale pending deployment "
+                    f"{d['deployment_uuid'][:8]} ({d.get('subdomain')}) as failed."
+                )
+            except Exception as e:
+                self.logger.error(
+                    f"Reconciliation update failed for {d.get('deployment_uuid')}: {e}"
+                )
+        if stale:
+            await self._notify(
+                'warning', 'Deployment reconciliation',
+                f"Marked {len(stale)} stale 'pending' deployment(s) as failed on startup "
+                "(crashed mid-deploy).",
+                source='deploy', critical=True,
+            )
+
+    async def _reclaim_subdomain(
+        self, subdomain: str, run_id: str, log_lines: list, pat: str = ''
+    ):
+        """
+        Tear down leftovers for a subdomain that has no live deployment, so a fresh deploy
+        starts clean. Best-effort and idempotent: each step is independent and logged.
+        Only call this when get_live_deployment_by_subdomain() returned nothing.
+        """
+        loop = asyncio.get_running_loop()
+
+        async def emit(line: str):
+            await self._emit(run_id, log_lines, line, pat)
+
+        fqdn               = f"{subdomain}.{_DOMAIN}"
+        deploy_path        = os.path.join(_DEPLOY_BASE, subdomain)
+        nginx_config_path  = os.path.join(_NGINX_AVAILABLE, fqdn)
+        nginx_symlink_path = os.path.join(_NGINX_ENABLED, fqdn)
+
+        stale         = await get_deployments_by_subdomain(subdomain)
+        dir_exists    = await loop.run_in_executor(None, os.path.exists, deploy_path)
+        config_exists = await loop.run_in_executor(None, os.path.exists, nginx_config_path)
+
+        if not stale and not dir_exists and not config_exists:
+            return  # nothing to reclaim
+
+        await emit(f"[RECLAIM] Clearing remnants for '{subdomain}'...")
+
+        # pm2 processes for each stale row
+        for d in stale:
+            name = d.get('pm2_name') or (d.get('deployment_uuid') or '')[:12]
+            if name:
+                await self.run_exec(['pm2', 'delete', name])
+
+        # nginx config + symlink
+        def _rm_nginx():
+            for p in (nginx_symlink_path, nginx_config_path):
+                try:
+                    if os.path.islink(p) or os.path.exists(p):
+                        os.remove(p)
+                except OSError:
+                    pass
+        await loop.run_in_executor(None, _rm_nginx)
+
+        # Cloudflare records: stored ids first, then a name lookup for any the row didn't
+        # capture (crash before persist), so no duplicate A record is left behind.
+        cf_cog = self.bot.get_cog('CloudflareCog')
+        if cf_cog:
+            record_ids = {d['cf_record_id'] for d in stale if d.get('cf_record_id')}
+            try:
+                data, _ = await cf_cog.list_dns_records(type='A', name=fqdn)
+                for rec in (data or []):
+                    if rec.get('id'):
+                        record_ids.add(rec['id'])
+            except Exception:
+                pass
+            for rid in record_ids:
+                try:
+                    await cf_cog.delete_dns_record(rid)
+                except Exception:
+                    pass
+
+        # certbot certificate
+        await self.run_exec(
+            ['sudo', 'certbot', 'delete', '--cert-name', fqdn, '--non-interactive'],
+            timeout=60,
+        )
+
+        # deploy directory
+        if dir_exists:
+            def _rm_dir():
+                try:
+                    shutil.rmtree(deploy_path)
+                except Exception:
+                    pass
+            await loop.run_in_executor(None, _rm_dir)
+
+        # Hard-delete stale rows. deployments.subdomain is UNIQUE, so a leftover row
+        # (even 'failed') would block the new deploy's INSERT; removing it frees the
+        # subdomain and its port. Audit history remains in deployment_logs (no FK).
+        for d in stale:
+            await delete_deployment_row(d['deployment_uuid'])
+
+        # Reload nginx if it still validates after removing the config.
+        code, _, _ = await self.run_exec(['sudo', 'nginx', '-t'], timeout=30)
+        if code == 0:
+            await self.run_exec(['sudo', 'systemctl', 'reload', 'nginx'], timeout=30)
+
+        await emit("[RECLAIM] Remnants cleared.")
 
     async def _cleanup_failed_deploy(
         self,
@@ -1210,6 +1895,21 @@ class DeploymentCog(commands.Cog):
                     f"DNS record {cleanup['cf_record_id']} was NOT deleted."
                 )
 
+        if cleanup.get('cert_name'):
+            await emit(f"[CLEANUP] Deleting SSL certificate '{cleanup['cert_name']}'...")
+            code, _, err = await self.run_exec(
+                ['sudo', 'certbot', 'delete', '--cert-name', cleanup['cert_name'],
+                 '--non-interactive'],
+                timeout=60,
+            )
+            if code == 0:
+                await emit("[CLEANUP] SSL certificate deleted.")
+            else:
+                await emit(
+                    f"[CLEANUP] Warning: could not delete certificate "
+                    f"'{cleanup['cert_name']}': {err.strip()}. Manual cleanup may be required."
+                )
+
         if cleanup.get('makedirs') and cleanup.get('deploy_path'):
             def _rm_dir():
                 try:
@@ -1269,7 +1969,10 @@ class DeploymentCog(commands.Cog):
                     pass
             await loop.run_in_executor(None, _rm_deploy)
 
-        await update_deployment(deployment_uuid, status='deleted')
+        # Hard-delete the row: subdomain is UNIQUE, so a soft-deleted row would block
+        # ever re-deploying this subdomain. (The previous status='deleted' was also an
+        # invalid enum value and silently failed.) Audit history stays in deployment_logs.
+        await delete_deployment_row(deployment_uuid)
         return True, "Deployment deleted successfully."
 
     async def get_env_lines(self, deployment_uuid: str) -> tuple[list, str]:
@@ -1522,6 +2225,7 @@ class DeploymentCog(commands.Cog):
         log_lines: list[str] = []
         success    = False
         log_created = False
+        rolled_back = False
 
         async def emit(line: str):
             await self._emit(run_id, log_lines, line)
@@ -1571,6 +2275,14 @@ class DeploymentCog(commands.Cog):
                             await emit(f"[REBUILD] Branch '{branch}' verified.")
                     else:
                         await emit(f"[REBUILD] Could not get remote URL, proceeding with branch '{branch}'")
+
+                    # Record the currently-deployed commit so a failed rebuild can roll back to it.
+                    prev_sha = None
+                    code_sha, out_sha, _ = await self.run_exec(
+                        ['git', 'rev-parse', 'HEAD'], cwd=deploy_path
+                    )
+                    if code_sha == 0 and out_sha.strip():
+                        prev_sha = out_sha.strip()
 
                     await emit("[REBUILD] Fetching latest code from git...")
                     for step in [
@@ -1650,6 +2362,12 @@ class DeploymentCog(commands.Cog):
                             if code != 0:
                                 await emit(f"[FAIL] pm2 failed (exit {code}).")
                                 raise DeployError("pm2 failed.")
+                            online, detail = await self._pm2_is_online(pm2_name)
+                            if not online:
+                                await emit(
+                                    f"[WARN] pm2 process '{pm2_name}' not healthy after rebuild "
+                                    f"({detail}); the new build may be crashing."
+                                )
                         else:
                             await emit("[REBUILD] Static stack — build output refreshed; no process restart needed.")
 
@@ -1695,28 +2413,28 @@ class DeploymentCog(commands.Cog):
 
                     await emit("[REBUILD] Performing health check...")
                     fqdn = f"{deployment['subdomain']}.{_DOMAIN}"
-                    health_ok = False
-                    for attempt in range(5):
-                        try:
-                            async with aiohttp.ClientSession() as session:
-                                async with session.get(f"https://{fqdn}", timeout=aiohttp.ClientTimeout(total=10)) as resp:
-                                    if resp.status == 200:
-                                        health_ok = True
-                                        await emit(f"[HEALTH] Site responded with HTTP {resp.status} (attempt {attempt+1}/5).")
-                                        break
-                                    else:
-                                        await emit(f"[HEALTH] HTTP {resp.status} (attempt {attempt+1}/5).")
-                        except Exception as e:
-                            await emit(f"[HEALTH] Error: {e} (attempt {attempt+1}/5).")
-                        if attempt < 4:
-                            await asyncio.sleep(3)
+                    health_ok = await self._http_health_check(fqdn, emit)
+
                     if health_ok:
                         await emit("[HEALTH] Health check passed.")
+                        success = True
+                        await emit("[REBUILD] Rebuild complete.")
+                    elif prev_sha:
+                        # New build is unhealthy — roll back to the last-good commit.
+                        await emit(f"[ROLLBACK] Rebuild unhealthy; reverting to {prev_sha[:8]}...")
+                        rolled_back = True
+                        reverted = await self._revert_to_commit(
+                            deploy_path, stack, pm2_name, assigned_port, prev_sha, emit
+                        )
+                        if reverted and await self._http_health_check(fqdn, emit):
+                            success = True
+                            await emit("[ROLLBACK] Previous build restored; site healthy again.")
+                        else:
+                            success = False
+                            await emit("[ROLLBACK] Rollback did not restore a healthy site.")
                     else:
-                        await emit("[HEALTH] Health check failed after rebuild.")
-
-                    success = True
-                    await emit("[REBUILD] Rebuild complete.")
+                        await emit("[HEALTH] Health check failed after rebuild; no prior commit to revert to.")
+                        success = False
 
         except DeployError:
             pass
@@ -1731,6 +2449,28 @@ class DeploymentCog(commands.Cog):
                 await update_deployment_log(
                     run_id, 'success' if success else 'failed', full_log
                 )
+                fqdn = f"{deployment['subdomain']}.{_DOMAIN}"
+                if success and rolled_back:
+                    await self._notify(
+                        'warning', 'Rebuild reverted',
+                        f"`{fqdn}` rebuild was unhealthy and was rolled back to the previous build.",
+                        source='rebuild', target=fqdn, critical=True,
+                        fields={'Run': run_id, 'By': triggered_by},
+                    )
+                elif success:
+                    await self._notify(
+                        'success', 'Rebuild complete', f"`{fqdn}` rebuilt.",
+                        source='rebuild', target=fqdn,
+                        fields={'Run': run_id, 'By': triggered_by},
+                    )
+                else:
+                    await self._notify(
+                        'error', 'Rebuild failed',
+                        f"`{fqdn}` rebuild failed — see deployment logs."
+                        + (" Rollback also failed; site may be down." if rolled_back else ""),
+                        source='rebuild', target=fqdn, critical=True,
+                        fields={'Run': run_id, 'By': triggered_by},
+                    )
             q = self._active_streams.get(run_id)
             if q:
                 await q.put(None)

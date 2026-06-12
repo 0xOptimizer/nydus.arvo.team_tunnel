@@ -12,7 +12,20 @@ import secrets
 from cryptography.fernet import Fernet, InvalidToken
 import discord
 from discord import Option, SlashCommandGroup
-from discord.ext import commands
+from discord.ext import commands, tasks
+
+# Self-backup of the nydus metadata DB.
+_NYDUS_DB_BACKUP_DIR = os.getenv('NYDUS_DB_BACKUP_DIR', '/opt/backups/nydus/db')
+_NYDUS_BACKUP_KEEP = int(os.getenv('NYDUS_BACKUP_KEEP', '12'))  # prune to most-recent N
+# High-volume tables: keep their STRUCTURE but drop their DATA from the metadata backup.
+_NYDUS_HEAVY_TABLES = [
+    t.strip() for t in os.getenv(
+        'NYDUS_BACKUP_EXCLUDE_DATA',
+        'nginx_requests,system_stats,auth_key_usage,deployment_logs,slash_command_logs,'
+        'user_login_attempts,demo_school_attendance,demo_school_attendance_tokens,'
+        'tusd_uploads,tusd_upload_meta'
+    ).split(',') if t.strip()
+]
 
 from database.db import (
     execute_query,
@@ -54,6 +67,26 @@ _TOUHOU_CHARACTERS = [
 ]
 
 
+def _normalize_hosts(allowed_hosts) -> List[str]:
+    """
+    Turn a host spec (CSV string or list) into the actual MySQL host list.
+    Empty / '*' / '%' → ['%'] (remote from anywhere). Otherwise the explicit hosts
+    (e.g. 'localhost', a specific IP, or several). Used so newly-created users are
+    remote-capable by default instead of silently 'localhost'.
+    """
+    if not allowed_hosts:
+        return ['%']
+    if isinstance(allowed_hosts, str):
+        parts = [h.strip() for h in allowed_hosts.split(',') if h.strip()]
+    else:
+        parts = [str(h).strip() for h in allowed_hosts if str(h).strip()]
+    if not parts:
+        return ['%']
+    if any(p in ('*', '%') for p in parts):
+        return ['%']
+    return parts
+
+
 class DatabaseBackend(ABC):
 
     @abstractmethod
@@ -63,16 +96,16 @@ class DatabaseBackend(ABC):
     async def drop_database(self, db_name: str) -> Tuple[bool, str]: pass
 
     @abstractmethod
-    async def create_user(self, username: str, password: str) -> Tuple[bool, str]: pass
+    async def create_user(self, username: str, password: str, hosts: List[str]) -> Tuple[bool, str]: pass
 
     @abstractmethod
-    async def drop_user(self, username: str) -> Tuple[bool, str]: pass
+    async def drop_user(self, username: str, hosts: List[str]) -> Tuple[bool, str]: pass
 
     @abstractmethod
-    async def grant_privileges(self, db_name: str, username: str, privileges: str) -> Tuple[bool, str]: pass
+    async def grant_privileges(self, db_name: str, username: str, privileges: str, hosts: List[str]) -> Tuple[bool, str]: pass
 
     @abstractmethod
-    async def revoke_privileges(self, db_name: str, username: str, privileges: str) -> Tuple[bool, str]: pass
+    async def revoke_privileges(self, db_name: str, username: str, privileges: str, hosts: List[str]) -> Tuple[bool, str]: pass
 
     @abstractmethod
     async def backup(self, db_name: str, backup_path: str) -> Tuple[bool, str]: pass
@@ -108,9 +141,9 @@ class MySQLBackend(DatabaseBackend):
             return False, f"Failed to drop database `{db_name}`"
         return True, ""
 
-    async def create_user(self, username: str, password: str) -> Tuple[bool, str]:
+    async def create_user(self, username: str, password: str, hosts: List[str]) -> Tuple[bool, str]:
         errors = []
-        for host in self._resolved_hosts:
+        for host in (hosts or self._resolved_hosts):
             result = await execute_query(
                 f"CREATE USER '{username}'@'{host}' IDENTIFIED BY %s",
                 (password,)
@@ -119,17 +152,17 @@ class MySQLBackend(DatabaseBackend):
                 errors.append(f"{host}: query failed")
         return (False, "; ".join(errors)) if errors else (True, "")
 
-    async def drop_user(self, username: str) -> Tuple[bool, str]:
+    async def drop_user(self, username: str, hosts: List[str]) -> Tuple[bool, str]:
         errors = []
-        for host in self._resolved_hosts:
+        for host in (hosts or self._resolved_hosts):
             result = await execute_query(f"DROP USER IF EXISTS '{username}'@'{host}'")
             if result is None:
                 errors.append(f"{host}: query failed")
         return (False, "; ".join(errors)) if errors else (True, "")
 
-    async def grant_privileges(self, db_name: str, username: str, privileges: str) -> Tuple[bool, str]:
+    async def grant_privileges(self, db_name: str, username: str, privileges: str, hosts: List[str]) -> Tuple[bool, str]:
         errors = []
-        for host in self._resolved_hosts:
+        for host in (hosts or self._resolved_hosts):
             result = await execute_query(
                 f"GRANT {privileges} ON `{db_name}`.* TO '{username}'@'{host}'"
             )
@@ -137,9 +170,9 @@ class MySQLBackend(DatabaseBackend):
                 errors.append(f"{host}: query failed")
         return (False, "; ".join(errors)) if errors else (True, "")
 
-    async def revoke_privileges(self, db_name: str, username: str, privileges: str) -> Tuple[bool, str]:
+    async def revoke_privileges(self, db_name: str, username: str, privileges: str, hosts: List[str]) -> Tuple[bool, str]:
         errors = []
-        for host in self._resolved_hosts:
+        for host in (hosts or self._resolved_hosts):
             result = await execute_query(
                 f"REVOKE {privileges} ON `{db_name}`.* FROM '{username}'@'{host}'"
             )
@@ -281,6 +314,137 @@ class DatabaseCog(commands.Cog):
         if not self.backends:
             raise RuntimeError("No database backends configured. Please set DB credentials in your environment.")
 
+        # Weekly self-backup of the nydus metadata DB (runs once on startup, then every 7 days).
+        if 'mysql' in self.backends:
+            self.nydus_metadata_backup.start()
+
+    def cog_unload(self):
+        if self.nydus_metadata_backup.is_running():
+            self.nydus_metadata_backup.cancel()
+
+    # ------------------------------
+    # NYDUS METADATA SELF-BACKUP
+    # ------------------------------
+    @tasks.loop(hours=168)
+    async def nydus_metadata_backup(self):
+        try:
+            ok, msg = await self.backup_nydus_metadata()
+            if ok:
+                logger.info(f"Nydus metadata backup written: {msg}")
+            else:
+                logger.error(f"Nydus metadata backup failed: {msg}")
+        except Exception as e:
+            logger.error(f"Nydus metadata backup crashed: {e}")
+
+    @nydus_metadata_backup.before_loop
+    async def _before_nydus_backup(self):
+        await self.bot.wait_until_ready()
+
+    async def backup_nydus_metadata(self) -> Tuple[bool, str]:
+        """
+        Dump the nydus metadata DB to /opt/backups/nydus/db as a timestamped, unique
+        .sql.gz. Heavy/log tables keep their STRUCTURE but not their DATA, via two passes:
+          1) full dump of everything EXCEPT the heavy tables (--ignore-table),
+          2) structure-only dump of the heavy tables (--no-data).
+        """
+        host = os.getenv('DB_HOST')
+        port = os.getenv('DB_PORT', '3306')
+        user = os.getenv('DB_USER')
+        password = os.getenv('DB_PASSWORD')
+        dbname = os.getenv('DB_NAME', 'nydus')
+        if not (host and user and password is not None):
+            return False, "DB credentials not configured"
+
+        try:
+            os.makedirs(_NYDUS_DB_BACKUP_DIR, exist_ok=True)
+        except OSError as e:
+            return False, f"Cannot create backup dir {_NYDUS_DB_BACKUP_DIR}: {e}"
+
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        unique_id = secrets.token_hex(4)
+        filepath = os.path.join(_NYDUS_DB_BACKUP_DIR, f"{dbname}_{timestamp}_{unique_id}.sql.gz")
+
+        creds = ['-h', host, '-P', str(port), '-u', user, f'-p{password}']
+        ignore_args = [f'--ignore-table={dbname}.{t}' for t in _NYDUS_HEAVY_TABLES]
+        full_dump = ['mysqldump', *creds, '--single-transaction', '--routines', '--triggers',
+                     dbname, *ignore_args]
+        structure_only = ['mysqldump', *creds, '--single-transaction', '--no-data',
+                          dbname, *[t for t in _NYDUS_HEAVY_TABLES]]
+
+        async def _dump_into(fh, args):
+            proc = await asyncio.create_subprocess_exec(
+                *args, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+            )
+            err_chunks: List[bytes] = []
+
+            async def _read_err():
+                while True:
+                    chunk = await proc.stderr.read(8192)
+                    if not chunk:
+                        break
+                    err_chunks.append(chunk)
+
+            async def _write_out():
+                while True:
+                    chunk = await proc.stdout.read(8192)
+                    if not chunk:
+                        break
+                    fh.write(chunk)
+
+            await asyncio.gather(_write_out(), _read_err())
+            await proc.wait()
+            return proc.returncode, b''.join(err_chunks).decode(errors='replace')
+
+        try:
+            with gzip.open(filepath, 'wb') as fh:
+                code, err = await _dump_into(fh, full_dump)
+                if code != 0:
+                    raise RuntimeError(f"mysqldump (data) failed: {err.strip()}")
+                if _NYDUS_HEAVY_TABLES:
+                    code, err = await _dump_into(fh, structure_only)
+                    if code != 0:
+                        raise RuntimeError(f"mysqldump (structure) failed: {err.strip()}")
+        except Exception as e:
+            try:
+                if os.path.exists(filepath):
+                    os.unlink(filepath)
+            except OSError:
+                pass
+            return False, str(e)
+
+        await self._prune_nydus_backups(dbname)
+        return True, filepath
+
+    async def _prune_nydus_backups(self, dbname: str):
+        """Keep only the most recent _NYDUS_BACKUP_KEEP backups."""
+        if _NYDUS_BACKUP_KEEP <= 0:
+            return
+        try:
+            files = [
+                os.path.join(_NYDUS_DB_BACKUP_DIR, f)
+                for f in os.listdir(_NYDUS_DB_BACKUP_DIR)
+                if f.startswith(f"{dbname}_") and f.endswith(".sql.gz")
+            ]
+            files.sort(key=lambda p: os.path.getmtime(p), reverse=True)
+            for stale in files[_NYDUS_BACKUP_KEEP:]:
+                try:
+                    os.unlink(stale)
+                except OSError:
+                    pass
+        except OSError:
+            pass
+
+    @db.command(name="nydusbackup", description="Back up the nydus metadata DB now")
+    async def cmd_nydus_backup(self, ctx: discord.ApplicationContext):
+        if not self._check_dev(ctx):
+            await ctx.respond("Unauthorized.", ephemeral=True)
+            return
+        await ctx.defer(ephemeral=True)
+        ok, msg = await self.backup_nydus_metadata()
+        await ctx.followup.send(
+            f"Backup written: `{msg}`" if ok else f"Backup failed: {msg}", ephemeral=True
+        )
+
     def _check_dev(self, ctx: discord.ApplicationContext) -> bool:
         dev_id = os.getenv('DEV_ID')
         return dev_id is not None and str(ctx.author.id) == dev_id
@@ -353,13 +517,19 @@ class DatabaseCog(commands.Cog):
         await db_delete_database(database_uuid, deleted_by)
         return True, ""
 
+    async def _stored_user_hosts(self, user_uuid: str) -> List[str]:
+        """The MySQL host(s) a user was created on, so grant/drop/revoke match create."""
+        user = await get_database_user(user_uuid=user_uuid)
+        return _normalize_hosts(user.get('allowed_hosts') if user else '%')
+
     async def create_actual_user(self, database_type: str, username: str, password: str,
-                                 created_by: str) -> Tuple[bool, str]:
-        success, error = await self._get_backend(database_type).create_user(username, password)
+                                 created_by: str, allowed_hosts: str = '%') -> Tuple[bool, str]:
+        hosts = _normalize_hosts(allowed_hosts)
+        success, error = await self._get_backend(database_type).create_user(username, password, hosts)
         if not success:
             return False, error
         encrypted = self._encrypt_password(password)
-        record = await db_create_database_user(username, encrypted, created_by)
+        record = await db_create_database_user(username, encrypted, created_by, ','.join(hosts))
         if not record:
             logger.error(f"User `{username}` created on server but metadata record failed.")
             return False, "User created but failed to record metadata."
@@ -367,7 +537,8 @@ class DatabaseCog(commands.Cog):
 
     async def drop_actual_user(self, database_type: str, username: str,
                                user_uuid: str, deleted_by: str) -> Tuple[bool, str]:
-        success, error = await self._get_backend(database_type).drop_user(username)
+        hosts = await self._stored_user_hosts(user_uuid)
+        success, error = await self._get_backend(database_type).drop_user(username, hosts)
         if not success:
             return False, error
         await db_delete_database_user(user_uuid, deleted_by)
@@ -376,7 +547,8 @@ class DatabaseCog(commands.Cog):
     async def grant_actual_privileges(self, database_type: str, database_name: str,
                                       database_uuid: str, username: str, user_uuid: str,
                                       privileges: str, granted_by: str) -> Tuple[bool, str]:
-        success, error = await self._get_backend(database_type).grant_privileges(database_name, username, privileges)
+        hosts = await self._stored_user_hosts(user_uuid)
+        success, error = await self._get_backend(database_type).grant_privileges(database_name, username, privileges, hosts)
         if not success:
             return False, error
         await db_grant_database_privileges(database_uuid, user_uuid, privileges, granted_by)
@@ -385,7 +557,8 @@ class DatabaseCog(commands.Cog):
     async def revoke_actual_privileges(self, database_type: str, database_name: str,
                                        database_uuid: str, username: str, user_uuid: str,
                                        privileges: str, revoked_by: str) -> Tuple[bool, str]:
-        success, error = await self._get_backend(database_type).revoke_privileges(database_name, username, privileges)
+        hosts = await self._stored_user_hosts(user_uuid)
+        success, error = await self._get_backend(database_type).revoke_privileges(database_name, username, privileges, hosts)
         if not success:
             return False, error
         await db_revoke_database_privileges(database_uuid, user_uuid, revoked_by)
@@ -457,7 +630,10 @@ class DatabaseCog(commands.Cog):
 
         database_uuid = result
 
-        ok, result = await self.create_actual_user(database_type, username, password, created_by)
+        # Quickgen users are remote-capable by default ('%').
+        ok, result = await self.create_actual_user(
+            database_type, username, password, created_by, allowed_hosts='%'
+        )
         if not ok:
             await self.drop_actual_database(database_type, db_name, database_uuid, created_by)
             return False, result, {}

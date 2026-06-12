@@ -12,11 +12,16 @@ import discord
 from datetime import datetime, timedelta
 from database.db import (
     get_recent_system_resources_with_averages, get_webhook_project_by_uuid, get_all_webhook_projects, create_new_webhook_project,
+    get_webhook_project_by_subdomain,
     delete_webhook_project, add_github_project, get_all_github_projects, get_all_attached_projects,
     remove_github_project, get_user, get_auth_key, validate_auth_key, execute_query,
     get_all_recent_backups,
     get_all_schedules, get_schedule_by_uuid, set_schedule_enabled, set_schedule_next_run, create_schedule_log,
     get_all_deployments, get_deployment_by_uuid, update_deployment,
+    get_live_deployment_by_subdomain, get_active_deployments,
+    create_managed_service, get_managed_service, get_all_managed_services,
+    update_managed_service, delete_managed_service,
+    get_alerts, get_unacknowledged_alert_count, acknowledge_alert, acknowledge_all_alerts,
     create_tusd_upload, create_tusd_upload_meta, update_tusd_upload,
 )
 import jwt
@@ -48,14 +53,18 @@ MAX_METADATA_PAIRS = 50
 MAX_META_KEY_LENGTH   = 64
 MAX_META_VALUE_LENGTH = 512
 
+_SAFE_UPLOAD_ID_RE = re.compile(r'^[A-Za-z0-9_-]{8,128}$')
+
+
 def is_valid_uuid(uuid_str: str) -> bool:
-    """Validate UUID v4 format."""
-    return True
-    # try:
-    #     uuid_obj = uuid_lib.UUID(uuid_str)
-    #     return uuid_obj.version == 4
-    # except ValueError:
-    #     return False
+    """
+    Validate that an upload id is safe to use inside a filesystem path.
+
+    Not strictly UUIDv4 (tusd generates its own id format, which is why the original
+    UUIDv4 check was disabled), but a bounded alphanumeric/dash/underscore token —
+    enough to block path traversal, null bytes, and injection via the upload id.
+    """
+    return bool(uuid_str) and bool(_SAFE_UPLOAD_ID_RE.match(uuid_str))
 
 def secure_filename(filename: str) -> str:
     """Return a safe version of the filename (no path separators, null bytes)."""
@@ -193,12 +202,44 @@ class ApiCog(commands.Cog):
         self._add_route('GET', '/api/databases/backups/{backup_uuid}/download', self.handle_download_backup)
         self._add_route('GET', '/api/databases/{uuid}/backups', self.handle_get_database_backups)
 
+        # Control plane — server-wide
+        self._add_route('GET', '/api/server/overview', self.handle_server_overview)
+        self._add_route('GET', '/api/server/discover', self.handle_server_discover)
+
+        # Alerts / notifications feed (frontend-first)
+        self._add_route('GET', '/api/alerts', self.handle_list_alerts)
+        self._add_route('GET', '/api/alerts/count', self.handle_alert_count)
+        self._add_route('POST', '/api/alerts/ack-all', self.handle_ack_all_alerts)
+        self._add_route('POST', '/api/alerts/{alert_uuid}/ack', self.handle_ack_alert)
+
+        # Control plane — managed services (adopted/external)
+        self._add_route('GET', '/api/services', self.handle_list_services)
+        self._add_route('POST', '/api/services', self.handle_create_service)
+        self._add_route('DELETE', '/api/services/{service_uuid}', self.handle_delete_service)
+        self._add_route('POST', '/api/services/{service_uuid}/process', self.handle_service_process)
+        self._add_route('GET', '/api/services/{service_uuid}/logs', self.handle_service_logs)
+
         # Deployments
         self._add_route('GET', '/api/deployments', self.handle_list_deployments)
         self._add_route('GET', '/api/deployments/{deployment_uuid}', self.handle_get_deployment)
+        # Control plane — per-deployment status/logs/config/actions
+        self._add_route('GET', '/api/deployments/{deployment_uuid}/status', self.handle_deployment_status)
+        self._add_route('GET', '/api/deployments/{deployment_uuid}/logs/{kind}', self.handle_deployment_logs)
+        self._add_route('GET', '/api/deployments/{deployment_uuid}/config', self.handle_deployment_config)
+        self._add_route('POST', '/api/deployments/{deployment_uuid}/process', self.handle_deployment_process)
+        self._add_route('POST', '/api/deployments/{deployment_uuid}/nginx', self.handle_deployment_nginx)
+        self._add_route('POST', '/api/deployments/{deployment_uuid}/ssl/renew', self.handle_deployment_ssl_renew)
+        self._add_route('POST', '/api/deployments/{deployment_uuid}/dns/reconcile', self.handle_deployment_dns_reconcile)
+        # Webhook management (register/inspect/remove GitHub auto-deploy for a deployment)
+        self._add_route('GET', '/api/deployments/{deployment_uuid}/webhook', self.handle_get_webhook)
+        self._add_route('POST', '/api/deployments/{deployment_uuid}/webhook', self.handle_create_webhook)
+        self._add_route('DELETE', '/api/deployments/{deployment_uuid}/webhook', self.handle_delete_webhook)
         self._add_route('POST', '/api/deploy', self.handle_deploy)
         self._add_route('GET', '/api/deploy/logs/{run_uuid}', self.handle_stream_logs)
         self._add_route('POST', '/api/deploy/rebuild/{deployment_uuid}', self.handle_rebuild)
+        # In-product self-test: exercises the real pipeline against hermetic
+        # fixtures (LE staging) and streams via the deploy-logs SSE endpoint above.
+        self._add_route('POST', '/api/selftest', self.handle_selftest)
         self._add_route('DELETE', '/api/deployments/{deployment_uuid}', self.handle_delete_deployment)
         self._add_route('GET', '/api/deployments/{deployment_uuid}/env', self.handle_get_env)
         self._add_route('PUT', '/api/deployments/{deployment_uuid}/env', self.handle_update_env)
@@ -487,24 +528,74 @@ class ApiCog(commands.Cog):
     # WEBHOOKS
     # ------------------------------
     async def handle_webhook(self, request):
+        """
+        GitHub push webhook → rebuild the matching live deployment.
+
+        Verifies the HMAC signature, answers ping events, ignores non-push events and
+        pushes to a non-tracked branch, then resolves the deployment by the webhook
+        project's subdomain and queues a rebuild (no PAT needed — rebuild reuses the
+        persisted git remote).
+        """
         uuid = request.match_info['uuid']
         project = await get_webhook_project_by_uuid(uuid)
         if not project:
             return self.json_response({'error': 'Project not found'}, status=404)
+
+        # 1) Verify GitHub HMAC signature over the raw body.
         signature = request.headers.get('X-Hub-Signature-256')
         body = await request.read()
-        secret = project['webhook_secret']
+        secret = project.get('webhook_secret')
         if not secret:
             return self.json_response({'error': 'Secret config error'}, status=500)
-        hash_obj = hmac.new(secret.encode(), msg=body, digestmod=hashlib.sha256)
-        expected = "sha256=" + hash_obj.hexdigest()
+        expected = "sha256=" + hmac.new(
+            secret.encode(), msg=body, digestmod=hashlib.sha256
+        ).hexdigest()
         if not signature or not hmac.compare_digest(expected, signature):
             return self.json_response({'error': 'Invalid signature'}, status=401)
+
+        # 2) Event routing.
+        event = request.headers.get('X-GitHub-Event', '')
+        if event == 'ping':
+            return self.json_response({'status': 'pong'})
+        if event != 'push':
+            return self.json_response(
+                {'status': 'ignored', 'reason': f"event '{event}' not handled"}
+            )
+
+        # 3) Branch match: only rebuild when the pushed branch is the tracked one.
+        try:
+            payload = json.loads(body.decode('utf-8', errors='replace') or '{}')
+        except (ValueError, TypeError):
+            payload = {}
+        ref = payload.get('ref', '') or ''
+        pushed_branch = ref.split('refs/heads/', 1)[1] if ref.startswith('refs/heads/') else ref
+        tracked_branch = project.get('branch') or 'main'
+        if pushed_branch and pushed_branch != tracked_branch:
+            return self.json_response({
+                'status': 'ignored',
+                'reason': f"push to '{pushed_branch}' != tracked branch '{tracked_branch}'",
+            })
+
+        # 4) Resolve the live deployment for this subdomain and queue a rebuild.
         deployer = self.bot.get_cog('DeploymentCog')
-        if deployer:
-            asyncio.create_task(deployer.deploy_project(project))
-            return self.json_response({'status': 'queued'})
-        return self.json_response({'error': 'Deployment module unavailable'}, status=500)
+        if not deployer:
+            return self.json_response({'error': 'Deployment module unavailable'}, status=503)
+
+        subdomain = project.get('subdomain')
+        deployment = await get_live_deployment_by_subdomain(subdomain) if subdomain else None
+        if not deployment:
+            return self.json_response(
+                {'error': f"No live deployment for subdomain '{subdomain}' to rebuild"},
+                status=404,
+            )
+
+        run_id = deployer.queue_rebuild(deployment['deployment_uuid'], 'webhook')
+        await self._log_to_discord(
+            'Webhook rebuild queued',
+            f"Push to `{pushed_branch or tracked_branch}` → rebuilding "
+            f"`{subdomain}` (run `{run_id}`).",
+        )
+        return self.json_response({'status': 'queued', 'run_id': run_id}, status=202)
 
     # ------------------------------
     # CLOUDFLARE
@@ -730,9 +821,13 @@ class ApiCog(commands.Cog):
             username = data.get('username')
             password = data.get('password')
             created_by = data.get('created_by')
+            # Optional: 'localhost' | '%' | '*' | CSV of hosts. Defaults to remote ('%').
+            allowed_hosts = data.get('allowed_hosts', '%')
             if not all([database_type, username, password, created_by]):
                 return self.json_response({'error': 'Missing required fields: database_type, username, password, created_by'}, status=400)
-            success, result = await db_cog.create_actual_user(database_type, username, password, created_by)
+            success, result = await db_cog.create_actual_user(
+                database_type, username, password, created_by, allowed_hosts=allowed_hosts
+            )
             if not success:
                 return self.json_response({'error': result}, status=500)
             return self.json_response({'user_uuid': result}, status=201)
@@ -901,6 +996,19 @@ class ApiCog(commands.Cog):
             with open(credentials_path, 'w') as f:
                 json.dump(credentials, f)
             os.chmod(credentials_path, 0o644)
+
+            # The handoff file holds plaintext DB credentials in a world-readable /tmp.
+            # The phpMyAdmin redirect consumes it immediately; expire it shortly after so
+            # the exposure window is seconds, not until reboot. (Perms stay 0o644 because
+            # the consuming pma process may run as a different user.)
+            async def _expire_pma_creds(path: str):
+                await asyncio.sleep(30)
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
+            asyncio.create_task(_expire_pma_creds(credentials_path))
+
             return self.json_response({'token': token})
         except Exception as e:
             return self.json_response({'error': str(e)}, status=500)
@@ -1055,6 +1163,357 @@ class ApiCog(commands.Cog):
             return self.json_response({'error': 'Deployment not found'}, status=404)
         return self.json_response(deployment)
 
+    # ------------------------------
+    # CONTROL PLANE
+    # ------------------------------
+    def _domain(self):
+        return os.getenv('DEPLOY_DOMAIN', 'arvo.team')
+
+    async def _stream_shell(self, request, cmd):
+        """SSE stream of a shell command's output (raw 'data: <line>' frames)."""
+        response = web.StreamResponse(status=200, headers={
+            'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache',
+            'Connection': 'keep-alive', 'Access-Control-Allow-Origin': '*',
+        })
+        await response.prepare(request)
+        process = await asyncio.create_subprocess_shell(
+            cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
+        try:
+            while not process.stdout.at_eof():
+                line = await process.stdout.readline()
+                if not line:
+                    await asyncio.sleep(0.05)
+                    continue
+                payload = line.decode(errors='ignore').replace('\r', '').rstrip('\n')
+                await response.write(f"data: {payload}\n\n".encode())
+                await response.drain()
+        except (asyncio.CancelledError, ConnectionResetError):
+            pass
+        finally:
+            if process.returncode is None:
+                process.kill()
+                await process.wait()
+        return response
+
+    async def _stream_static_text(self, request, text):
+        """SSE stream of static text (for stored build logs), ending with [done]."""
+        response = web.StreamResponse(status=200, headers={
+            'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache',
+            'Connection': 'keep-alive', 'Access-Control-Allow-Origin': '*',
+        })
+        await response.prepare(request)
+        try:
+            for line in (text or '').splitlines():
+                await response.write(f"data: {line}\n\n".encode())
+            await response.write(b"data: [done]\n\n")
+            await response.drain()
+        except ConnectionResetError:
+            pass
+        return response
+
+    async def handle_server_overview(self, request):
+        dep = self.bot.get_cog('DeploymentCog')
+        if not dep:
+            return self.json_response({'error': 'Deployment module unavailable'}, status=503)
+        deployments = await get_active_deployments()
+        services = await get_all_managed_services()
+        dep_status = await dep.build_overview(deployments)
+        stats = await get_recent_system_resources_with_averages()
+        return self.json_response({
+            'system': stats,
+            'deployments': dep_status,
+            'managed_services': services,
+        })
+
+    async def handle_server_discover(self, request):
+        dep = self.bot.get_cog('DeploymentCog')
+        if not dep:
+            return self.json_response({'error': 'Deployment module unavailable'}, status=503)
+        return self.json_response(await dep.discover_server_state())
+
+    # ------------------------------
+    # ALERTS / NOTIFICATIONS
+    # ------------------------------
+    async def handle_list_alerts(self, request):
+        try:
+            limit = int(request.query.get('limit', 50))
+        except ValueError:
+            limit = 50
+        unack = request.query.get('unacknowledged', 'false').lower() == 'true'
+        level = request.query.get('level') or None
+        alerts = await get_alerts(limit=limit, unacknowledged_only=unack, level=level)
+        return self.json_response(alerts)
+
+    async def handle_alert_count(self, request):
+        return self.json_response({'unacknowledged': await get_unacknowledged_alert_count()})
+
+    async def handle_ack_alert(self, request):
+        ok = await acknowledge_alert(request.match_info['alert_uuid'])
+        if not ok:
+            return self.json_response({'error': 'Alert not found or already acknowledged'}, status=404)
+        return self.json_response({'status': 'acknowledged'})
+
+    async def handle_ack_all_alerts(self, request):
+        await acknowledge_all_alerts()
+        return self.json_response({'status': 'acknowledged'})
+
+    async def handle_list_services(self, request):
+        return self.json_response(await get_all_managed_services())
+
+    async def handle_create_service(self, request):
+        try:
+            data = await request.json()
+            name = data.get('name')
+            service_type = data.get('service_type')
+            if not name or service_type not in ('pm2', 'systemd', 'nginx', 'static'):
+                return self.json_response({'error': 'name and a valid service_type are required'}, status=400)
+            record = await create_managed_service(
+                name=name, service_type=service_type,
+                pm2_name=data.get('pm2_name'), systemd_unit=data.get('systemd_unit'),
+                fqdn=data.get('fqdn'), health_url=data.get('health_url'),
+                deploy_path=data.get('deploy_path'), port=data.get('port'),
+                git_url=data.get('git_url'), branch=data.get('branch'),
+            )
+            if not record:
+                return self.json_response({'error': 'Failed to create service (duplicate name?)'}, status=500)
+            return self.json_response(record, status=201)
+        except Exception as e:
+            return self.json_response({'error': str(e)}, status=500)
+
+    async def handle_delete_service(self, request):
+        ok = await delete_managed_service(request.match_info['service_uuid'])
+        if not ok:
+            return self.json_response({'error': 'Delete failed'}, status=500)
+        return self.json_response({'status': 'deleted'})
+
+    async def handle_service_process(self, request):
+        maint = self.bot.get_cog('MaintenanceCog')
+        if not maint:
+            return self.json_response({'error': 'Maintenance module unavailable'}, status=503)
+        service = await get_managed_service(service_uuid=request.match_info['service_uuid'])
+        if not service:
+            return self.json_response({'error': 'Service not found'}, status=404)
+        try:
+            data = await request.json()
+        except Exception:
+            data = {}
+        ok, msg = await maint.control_managed_service(service, data.get('action', 'restart'))
+        if not ok:
+            return self.json_response({'error': msg}, status=400)
+        return self.json_response({'status': data.get('action', 'restart'), 'detail': msg})
+
+    async def handle_service_logs(self, request):
+        maint = self.bot.get_cog('MaintenanceCog')
+        if not maint:
+            return self.json_response({'error': 'Maintenance module unavailable'}, status=503)
+        service = await get_managed_service(service_uuid=request.match_info['service_uuid'])
+        if not service:
+            return self.json_response({'error': 'Service not found'}, status=404)
+        try:
+            lines = int(request.query.get('lines', 100))
+        except ValueError:
+            lines = 100
+        cmd = maint.managed_service_log_command(service, lines=lines)
+        if not cmd:
+            return self.json_response({'error': 'No logs for this service type'}, status=400)
+        return await self._stream_shell(request, cmd)
+
+    async def handle_deployment_status(self, request):
+        dep = self.bot.get_cog('DeploymentCog')
+        if not dep:
+            return self.json_response({'error': 'Deployment module unavailable'}, status=503)
+        deployment = await get_deployment_by_uuid(request.match_info['deployment_uuid'])
+        if not deployment:
+            return self.json_response({'error': 'Deployment not found'}, status=404)
+        return self.json_response(await dep.get_deployment_status(deployment))
+
+    async def handle_deployment_logs(self, request):
+        deployment = await get_deployment_by_uuid(request.match_info['deployment_uuid'])
+        if not deployment:
+            return self.json_response({'error': 'Deployment not found'}, status=404)
+        kind = request.match_info['kind']
+        fqdn = f"{deployment['subdomain']}.{self._domain()}"
+        pm2_name = deployment.get('pm2_name') or deployment['deployment_uuid'][:12]
+        if kind == 'app':
+            if deployment.get('tech_stack') != 'node':
+                return self.json_response({'error': 'No app process for this stack'}, status=400)
+            return await self._stream_shell(request, f"pm2 logs {pm2_name} --lines 100 --time --raw")
+        if kind == 'nginx-access':
+            return await self._stream_shell(request, f"tail -n 100 -F /var/log/nginx/{fqdn}.access.log")
+        if kind == 'nginx-error':
+            return await self._stream_shell(request, "tail -n 100 -F /var/log/nginx/error.log")
+        if kind == 'build':
+            row = await execute_query(
+                "SELECT output_log FROM deployment_logs WHERE deployment_uuid=%s "
+                "ORDER BY started_at DESC LIMIT 1",
+                (request.match_info['deployment_uuid'],), fetch_one=True)
+            return await self._stream_static_text(request, (row or {}).get('output_log') or 'No build logs.')
+        return self.json_response({'error': 'Unknown log kind'}, status=400)
+
+    async def handle_deployment_config(self, request):
+        deployment = await get_deployment_by_uuid(request.match_info['deployment_uuid'])
+        if not deployment:
+            return self.json_response({'error': 'Deployment not found'}, status=404)
+        fqdn = f"{deployment['subdomain']}.{self._domain()}"
+        nginx_path = f"/etc/nginx/sites-available/{fqdn}"
+        pkg_path = os.path.join(deployment.get('deploy_path', '') or '', 'package.json')
+
+        def _read():
+            nginx_cfg, scripts = None, None
+            try:
+                with open(nginx_path, 'r', errors='replace') as f:
+                    nginx_cfg = f.read()
+            except OSError:
+                pass
+            try:
+                with open(pkg_path, 'r') as f:
+                    scripts = json.load(f).get('scripts', {})
+            except Exception:
+                pass
+            return nginx_cfg, scripts
+        loop = asyncio.get_running_loop()
+        nginx_cfg, scripts = await loop.run_in_executor(None, _read)
+        return self.json_response({
+            'nginx_config': nginx_cfg,
+            'package_scripts': scripts,
+            'env_file_name': deployment.get('env_file_name'),
+        })
+
+    async def handle_deployment_process(self, request):
+        dep = self.bot.get_cog('DeploymentCog')
+        if not dep:
+            return self.json_response({'error': 'Deployment module unavailable'}, status=503)
+        deployment = await get_deployment_by_uuid(request.match_info['deployment_uuid'])
+        if not deployment:
+            return self.json_response({'error': 'Deployment not found'}, status=404)
+        if deployment.get('tech_stack') != 'node':
+            return self.json_response({'error': 'No process for this stack'}, status=400)
+        try:
+            data = await request.json()
+        except Exception:
+            data = {}
+        pm2_name = deployment.get('pm2_name') or deployment['deployment_uuid'][:12]
+        ok, msg = await dep.control_process(pm2_name, data.get('action', 'restart'))
+        if not ok:
+            return self.json_response({'error': msg}, status=400)
+        return self.json_response({'status': data.get('action', 'restart'), 'detail': msg})
+
+    async def handle_deployment_nginx(self, request):
+        dep = self.bot.get_cog('DeploymentCog')
+        if not dep:
+            return self.json_response({'error': 'Deployment module unavailable'}, status=503)
+        deployment = await get_deployment_by_uuid(request.match_info['deployment_uuid'])
+        if not deployment:
+            return self.json_response({'error': 'Deployment not found'}, status=404)
+        try:
+            data = await request.json()
+        except Exception:
+            data = {}
+        fqdn = f"{deployment['subdomain']}.{self._domain()}"
+        ok, msg = await dep.control_nginx(data.get('action', 'reload'), fqdn)
+        if not ok:
+            return self.json_response({'error': msg}, status=400)
+        return self.json_response({'status': data.get('action', 'reload'), 'detail': msg})
+
+    async def handle_deployment_ssl_renew(self, request):
+        dep = self.bot.get_cog('DeploymentCog')
+        if not dep:
+            return self.json_response({'error': 'Deployment module unavailable'}, status=503)
+        deployment = await get_deployment_by_uuid(request.match_info['deployment_uuid'])
+        if not deployment:
+            return self.json_response({'error': 'Deployment not found'}, status=404)
+        ok, msg = await dep.renew_ssl(f"{deployment['subdomain']}.{self._domain()}")
+        if not ok:
+            return self.json_response({'error': msg}, status=400)
+        return self.json_response({'status': 'renewed', 'detail': msg})
+
+    async def handle_deployment_dns_reconcile(self, request):
+        dep = self.bot.get_cog('DeploymentCog')
+        if not dep:
+            return self.json_response({'error': 'Deployment module unavailable'}, status=503)
+        deployment = await get_deployment_by_uuid(request.match_info['deployment_uuid'])
+        if not deployment:
+            return self.json_response({'error': 'Deployment not found'}, status=404)
+        ok, msg = await dep.reconcile_dns(deployment['subdomain'])
+        if not ok:
+            return self.json_response({'error': msg}, status=400)
+        return self.json_response({'status': 'reconciled', 'detail': msg})
+
+    # ------------------------------
+    # WEBHOOK MANAGEMENT
+    # ------------------------------
+    def _webhook_url(self, webhook_uuid):
+        # GitHub must reach /webhook/{uuid} publicly. WEBHOOK_PUBLIC_BASE is where this API
+        # is exposed (e.g. https://nydus.arvo.team). If unset, return the path only.
+        base = os.getenv('WEBHOOK_PUBLIC_BASE', '').rstrip('/')
+        path = f"/webhook/{webhook_uuid}"
+        return base + path if base else path
+
+    def _webhook_payload(self, wh):
+        return {
+            'webhook_uuid': wh['webhook_uuid'],
+            'url': self._webhook_url(wh['webhook_uuid']),
+            'secret': wh['webhook_secret'],
+            'branch': wh.get('branch'),
+            'content_type': 'application/json',
+            'events': ['push'],
+        }
+
+    async def handle_get_webhook(self, request):
+        """GET /api/deployments/{deployment_uuid}/webhook — the webhook for this deployment."""
+        deployment = await get_deployment_by_uuid(request.match_info['deployment_uuid'])
+        if not deployment:
+            return self.json_response({'error': 'Deployment not found'}, status=404)
+        wh = await get_webhook_project_by_subdomain(deployment['subdomain'])
+        if not wh:
+            return self.json_response({'error': 'No webhook configured'}, status=404)
+        return self.json_response(self._webhook_payload(wh))
+
+    async def handle_create_webhook(self, request):
+        """
+        POST /api/deployments/{deployment_uuid}/webhook — register GitHub auto-deploy.
+        Idempotent: returns the existing webhook if one is already configured for the subdomain.
+        """
+        deployment = await get_deployment_by_uuid(request.match_info['deployment_uuid'])
+        if not deployment:
+            return self.json_response({'error': 'Deployment not found'}, status=404)
+
+        existing = await get_webhook_project_by_subdomain(deployment['subdomain'])
+        if existing:
+            return self.json_response(self._webhook_payload(existing))
+
+        from database.db import get_github_project_by_uuid
+        project = await get_github_project_by_uuid(deployment.get('project_uuid')) or {}
+        result = await create_new_webhook_project(
+            name=project.get('name') or deployment['subdomain'],
+            repo_url=project.get('git_url'),
+            branch=deployment.get('branch') or 'main',
+            tech_stack=deployment.get('tech_stack'),
+            subdomain=deployment['subdomain'],
+            cloudflare_id=deployment.get('cf_record_id'),
+            nginx_port=deployment.get('assigned_port'),
+        )
+        if not result.get('success'):
+            return self.json_response(
+                {'error': result.get('error', 'Failed to create webhook')}, status=500
+            )
+        return self.json_response(self._webhook_payload({
+            'webhook_uuid': result['webhook_uuid'],
+            'webhook_secret': result['webhook_secret'],
+            'branch': deployment.get('branch') or 'main',
+        }), status=201)
+
+    async def handle_delete_webhook(self, request):
+        """DELETE /api/deployments/{deployment_uuid}/webhook"""
+        deployment = await get_deployment_by_uuid(request.match_info['deployment_uuid'])
+        if not deployment:
+            return self.json_response({'error': 'Deployment not found'}, status=404)
+        wh = await get_webhook_project_by_subdomain(deployment['subdomain'])
+        if not wh:
+            return self.json_response({'error': 'No webhook configured'}, status=404)
+        await delete_webhook_project(wh['webhook_uuid'])
+        return self.json_response({'status': 'deleted'})
+
     async def handle_deploy(self, request):
         """POST /api/deploy  body: {project_uuid, subdomain, github_pat, triggered_by}"""
         dep_cog = self.bot.get_cog('DeploymentCog')
@@ -1111,13 +1570,22 @@ class ApiCog(commands.Cog):
         await response.prepare(request)
         try:
             while True:
-                line = await asyncio.wait_for(queue.get(), timeout=30.0)
+                try:
+                    line = await asyncio.wait_for(queue.get(), timeout=20.0)
+                except asyncio.TimeoutError:
+                    # Quiet stretch (e.g. npm install with no output). Send a keepalive
+                    # instead of erroring the stream — the client treats [keepalive] as a no-op.
+                    await response.write(b"data: [keepalive]\n\n")
+                    await response.drain()
+                    continue
                 if line is None:
+                    # End-of-run sentinel: signal a clean completion so the client closes
+                    # without rendering a spurious "connection lost" error.
+                    await response.write(b"data: [done]\n\n")
+                    await response.drain()
                     break
                 await response.write(f"data: {json.dumps({'line': line})}\n\n".encode())
                 await response.drain()
-        except asyncio.TimeoutError:
-            await response.write(f"data: {json.dumps({'error': 'Stream timeout'})}\n\n".encode())
         except ConnectionResetError:
             pass
         return response
@@ -1135,15 +1603,51 @@ class ApiCog(commands.Cog):
         run_id = dep_cog.queue_rebuild(deployment_uuid, triggered_by)
         return self.json_response({'run_id': run_id}, status=202)
 
+    async def handle_selftest(self, request):
+        """POST /api/selftest
+
+        Body (optional): {"variants": "all" | "static,node,rebuild,webhook,rollback",
+                          "cert_staging": true}
+        Returns 202 {run_id}; stream progress via GET /api/deploy/logs/{run_id}.
+        """
+        st_cog = self.bot.get_cog('SelfTestCog')
+        dep_cog = self.bot.get_cog('DeploymentCog')
+        if not st_cog or not dep_cog:
+            return self.json_response({'error': 'Self-test module unavailable'}, status=503)
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        variants = st_cog.parse_variants(body.get('variants', 'all'))
+        cert_staging = bool(body.get('cert_staging', True))
+        triggered_by = request.get('auth_key_data', {}).get('owner_discord_id', 'api')
+        run_id = st_cog.queue_selftest(triggered_by, variants, cert_staging=cert_staging)
+        if not run_id:
+            return self.json_response(
+                {'error': 'A self-test is already running; only one runs at a time.'},
+                status=409,
+            )
+        return self.json_response(
+            {'status': 'started', 'run_id': run_id, 'variants': variants,
+             'cert_staging': cert_staging, 'log_stream': f"/api/deploy/logs/{run_id}"},
+            status=202,
+        )
+
     async def handle_delete_deployment(self, request):
         """DELETE /api/deployments/{deployment_uuid}"""
         dep_cog = self.bot.get_cog('DeploymentCog')
         if not dep_cog:
             return self.json_response({'error': 'Deployment module unavailable'}, status=503)
         deployment_uuid = request.match_info['deployment_uuid']
+        # Capture the subdomain before deletion so we can clean up its webhook afterwards.
+        deployment = await get_deployment_by_uuid(deployment_uuid)
         success, msg = await dep_cog.delete_deployment(deployment_uuid)
         if not success:
             return self.json_response({'error': msg}, status=400)
+        if deployment:
+            wh = await get_webhook_project_by_subdomain(deployment['subdomain'])
+            if wh:
+                await delete_webhook_project(wh['webhook_uuid'])
         return self.json_response({'status': 'deleted', 'message': msg})
 
     async def handle_get_env(self, request):

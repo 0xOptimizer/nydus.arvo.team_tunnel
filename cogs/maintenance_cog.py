@@ -98,5 +98,51 @@ class MaintenanceCog(commands.Cog):
             await asyncio.sleep(1)
             asyncio.create_task(self._run_command("git pull && sudo systemctl restart nydus", cwd=self.bot_path))
 
+    # ------------------------------
+    # Registry-driven control (managed_services)
+    # ------------------------------
+    async def control_managed_service(self, service: dict, action: str):
+        """Lifecycle control for a managed_services row, dispatched by service_type."""
+        stype = service.get('service_type')
+        dep = self.bot.get_cog('DeploymentCog')
+
+        if stype == 'pm2':
+            if not dep:
+                return False, "DeploymentCog unavailable"
+            name = service.get('pm2_name') or service.get('name')
+            return await dep.control_process(name, action)
+
+        if stype == 'systemd':
+            unit = service.get('systemd_unit')
+            if not unit:
+                return False, "no systemd_unit configured"
+            if action not in ('restart', 'stop', 'start', 'reload'):
+                return False, f"Invalid systemd action '{action}'"
+            return await self._run_command(f"sudo systemctl {action} {unit}")
+
+        if stype == 'nginx':
+            if not dep:
+                return False, "DeploymentCog unavailable"
+            nginx_action = 'reload' if action in ('restart', 'reload') else action
+            return await dep.control_nginx(nginx_action, service.get('fqdn'))
+
+        if stype == 'static':
+            return False, "static services have no process to control"
+        return False, f"Unknown service_type '{stype}'"
+
+    def managed_service_log_command(self, service: dict, lines: int = 100):
+        """The shell command to tail a managed service's logs, by service_type."""
+        stype = service.get('service_type')
+        if stype == 'pm2':
+            name = service.get('pm2_name') or service.get('name')
+            return f"pm2 logs {name} --lines {lines} --time --raw"
+        if stype == 'systemd':
+            unit = service.get('systemd_unit')
+            return f"journalctl -u {unit} -n {lines} -f -o short-iso" if unit else None
+        if stype == 'nginx':
+            return f"tail -n {lines} -F /var/log/nginx/error.log"
+        return None
+
+
 def setup(bot):
     bot.add_cog(MaintenanceCog(bot))
