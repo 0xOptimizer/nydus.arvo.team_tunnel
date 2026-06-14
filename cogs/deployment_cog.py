@@ -15,9 +15,13 @@ from database.db import (
     create_deployment,
     create_deployment_log,
     delete_deployment_row,
+    get_active_deployments,
+    get_all_managed_services,
     get_deployment_by_subdomain,
     get_deployment_by_uuid,
+    get_deployments_by_fqdn,
     get_deployments_by_subdomain,
+    get_live_deployment_by_fqdn,
     get_live_deployment_by_subdomain,
     get_stale_pending_deployments,
     get_used_deployment_ports,
@@ -30,7 +34,13 @@ from utils.deploy_checks import (
     get_used_ports_from_nginx,
     redact_pat,
 )
-from utils.validators import validate_env_key, validate_subdomain
+from utils.domains import fqdn_of
+from utils.validators import validate_domain, validate_env_key, validate_subdomain
+
+
+def _cf_zone_of(deployment: dict):
+    """Cloudflare zone a deployment's A record lives in (None → managed arvo.team zone)."""
+    return deployment.get('cf_zone_id')
 
 _SEMAPHORE_LIMIT = int(os.getenv('DEPLOY_MAX_CONCURRENT', '2'))
 _DEPLOY_TIMEOUT  = int(os.getenv('DEPLOY_TIMEOUT', '600'))
@@ -564,14 +574,19 @@ class DeploymentCog(commands.Cog):
         m = re.search(r'VALID:\s*(\d+)\s*day', out)
         return int(m.group(1)) if m else None
 
-    async def _dns_state(self, subdomain: str) -> dict:
-        """Cloudflare A-record state for subdomain vs the expected SERVER_IP."""
-        fqdn = f"{subdomain}.{_DOMAIN}"
+    async def _dns_state(self, deployment: dict) -> dict:
+        """Cloudflare A-record state for a deployment vs the expected SERVER_IP."""
+        if (deployment.get('dns_mode') or 'subdomain') == 'external':
+            # DNS is client-managed; nydus has no record to inspect, so report it as
+            # unmanaged rather than as drift.
+            return {'present': None, 'content': None, 'proxied': None, 'drift': False, 'managed': False}
+        fqdn = fqdn_of(deployment)
+        zone_id = _cf_zone_of(deployment)
         cf = self.bot.get_cog('CloudflareCog')
         if not cf:
             return {'present': False, 'content': None, 'proxied': None, 'drift': True}
         try:
-            data, _ = await cf.list_dns_records(type='A', name=fqdn)
+            data, _ = await cf.list_dns_records(type='A', name=fqdn, zone_id=zone_id)
         except Exception:
             return {'present': False, 'content': None, 'proxied': None, 'drift': True}
         rec = (data or [None])[0]
@@ -598,7 +613,7 @@ class DeploymentCog(commands.Cog):
     async def get_deployment_status(self, deployment: dict) -> dict:
         """Aggregate live status for a deployment (pm2/http/ssl/dns/disk)."""
         subdomain = deployment.get('subdomain')
-        fqdn = f"{subdomain}.{_DOMAIN}"
+        fqdn = fqdn_of(deployment)
         stack = deployment.get('tech_stack')
         pm2_name = deployment.get('pm2_name') or (deployment.get('deployment_uuid') or '')[:12]
 
@@ -631,22 +646,120 @@ class DeploymentCog(commands.Cog):
             'deployment_uuid': deployment.get('deployment_uuid'),
             'subdomain': subdomain,
             'fqdn': fqdn,
+            'dns_mode': deployment.get('dns_mode') or 'subdomain',
             'stack': stack,
             'status': deployment.get('status'),
             'pm2': pm2_info,
             'http': await self._http_health(fqdn),
             'ssl': {'days_left': await self._ssl_days_left(fqdn)},
-            'dns': await self._dns_state(subdomain),
+            'dns': await self._dns_state(deployment),
             'disk_bytes': disk_bytes,
             'assigned_port': deployment.get('assigned_port'),
             'deployed_at': deployment.get('deployed_at'),
             'deployed_by': deployment.get('deployed_by'),
         }
 
-    async def control_process(self, pm2_name: str, action: str) -> tuple[bool, str]:
-        """pm2 lifecycle control for a process by name."""
+    async def _tail(self, path: str, lines: int = 120) -> str | None:
+        """Last `lines` of a file via `tail` (bounded — safe on large/rotated logs).
+        None if the file is missing or unreadable."""
+        if not path:
+            return None
+        code, out, _ = await self.run_exec(['tail', '-n', str(lines), path], timeout=15)
+        return out if code == 0 else None
+
+    async def get_process_diagnostics(self, pm2_name: str, lines: int = 120) -> dict:
+        """
+        Why a process is unhealthy — works whether it's online, stopped, errored, or lost.
+        Returns pm2's status/exit/restart counters plus the tail of its persisted stderr/stdout
+        files (which survive a crash), so a down app's "logs" aren't empty.
+        """
+        proc = await self._pm2_status(pm2_name)
+        diag = {
+            'pm2_name': pm2_name, 'known': bool(proc), 'status': None, 'restarts': None,
+            'unstable_restarts': None, 'exit_code': None, 'uptime': None,
+            'error_log': None, 'output_log': None, 'error_log_path': None,
+        }
+        err_path = out_path = None
+        if proc:
+            env = proc.get('pm2_env', {}) or {}
+            diag.update(
+                status=env.get('status'),
+                restarts=env.get('restart_time'),
+                unstable_restarts=env.get('unstable_restarts'),
+                exit_code=env.get('exit_code'),
+                uptime=env.get('pm_uptime'),
+            )
+            err_path = env.get('pm_err_log_path')
+            out_path = env.get('pm_out_log_path')
+        # pm2 lost the process entirely → fall back to the default log location by name.
+        if not err_path:
+            err_path = os.path.expanduser(f"~/.pm2/logs/{pm2_name}-error.log")
+        if not out_path:
+            out_path = os.path.expanduser(f"~/.pm2/logs/{pm2_name}-out.log")
+        diag['error_log_path'] = err_path
+        diag['error_log'] = await self._tail(err_path, lines)
+        diag['output_log'] = await self._tail(out_path, lines)
+        return diag
+
+    async def get_deployment_diagnostics(self, deployment: dict, lines: int = 120) -> dict:
+        """Crash/health diagnostics for a deployment: pm2 process state + recent stderr (node),
+        whether the assigned port is listening, and the tail of the nginx error log."""
+        stack = deployment.get('tech_stack')
+        out = {
+            'fqdn': fqdn_of(deployment), 'stack': stack, 'status': deployment.get('status'),
+            'assigned_port': deployment.get('assigned_port'),
+            'process': None, 'port_listening': None, 'nginx_error_log': None,
+        }
+        if stack == 'node':
+            pm2_name = deployment.get('pm2_name') or deployment['deployment_uuid'][:12]
+            out['process'] = await self.get_process_diagnostics(pm2_name, lines)
+            if deployment.get('assigned_port'):
+                out['port_listening'] = await self._http_port_ok(
+                    deployment['assigned_port'], attempts=1
+                )
+        out['nginx_error_log'] = await self._tail('/var/log/nginx/error.log', lines)
+        return out
+
+    async def control_process(
+        self, pm2_name: str, action: str, deploy_path: str = None, port: int = None
+    ) -> tuple[bool, str]:
+        """
+        pm2 lifecycle control for a process by name.
+
+        For start/restart/reload, if pm2 has no record of the process (e.g. it was lost to a
+        reboot or `pm2 kill`), recreate it fresh on its correct working dir and port via
+        `pm2 start npm -- start` (the same convention deploys use) — so a downed node app
+        actually comes back instead of erroring "process not found". Needs deploy_path (+ port)
+        to recreate; without them it reports what's missing rather than guessing.
+        """
         if action not in ('start', 'stop', 'restart', 'reload', 'flush'):
             return False, f"Invalid action '{action}'"
+
+        if action in ('start', 'restart', 'reload'):
+            code_desc, _, _ = await self.run_exec(['pm2', 'describe', pm2_name], timeout=30)
+            if code_desc != 0:
+                # pm2 doesn't know this process — recreate it on its real cwd + PORT.
+                if not deploy_path:
+                    return False, (
+                        f"pm2 has no process '{pm2_name}', and no deploy_path/port is known "
+                        "to recreate it. Set the deployment's path/port (or the managed "
+                        "service's deploy_path/port) and retry."
+                    )
+                env_extra = {'PORT': str(port)} if port else None
+                code, out, err = await self.run_exec(
+                    ['pm2', 'start', 'npm', '--name', pm2_name, '--', 'start'],
+                    cwd=deploy_path, env_extra=env_extra, timeout=120,
+                )
+                if code != 0:
+                    return False, (err or out or 'pm2 start failed').strip()
+                await self._notify(
+                    'info', 'Process recreated',
+                    f"`{pm2_name}` was missing and was started fresh"
+                    + (f" on port {port}" if port else "") + " via control plane.",
+                    source='control', target=pm2_name,
+                )
+                return True, (out or 'recreated').strip()
+
         cmd = ['pm2', 'flush', pm2_name] if action == 'flush' else ['pm2', action, pm2_name]
         code, out, err = await self.run_exec(cmd, timeout=60)
         if code != 0:
@@ -654,6 +767,65 @@ class DeploymentCog(commands.Cog):
         await self._notify('info', f"Process {action}", f"`{pm2_name}` {action} via control plane.",
                            source='control', target=pm2_name)
         return True, (out or '').strip()
+
+    async def _port_from_sites_available(self, fqdn: str) -> int | None:
+        """Upstream proxy_pass port from a site's nginx config — the on-disk source of truth
+        for a port when a DB row's assigned_port/port is missing or has drifted."""
+        if not fqdn:
+            return None
+        path = os.path.join(_NGINX_AVAILABLE, fqdn)
+        loop = asyncio.get_running_loop()
+
+        def _read():
+            try:
+                with open(path, 'r', errors='replace') as f:
+                    content = f.read()
+            except OSError:
+                return None
+            m = re.search(r'proxy_pass\s+http://localhost:(\d+)', content)
+            return int(m.group(1)) if m else None
+        return await loop.run_in_executor(None, _read)
+
+    async def recover_all(self) -> list:
+        """
+        Bring every active node deployment and every enabled pm2 managed service back online,
+        recreating any process pm2 has lost (on its stored deploy_path + port). Idempotent:
+        processes already online are left untouched. Persists the pm2 list at the end so a
+        future reboot can `pm2 resurrect`. Returns a per-target report.
+        """
+        report = []
+        pm2_map = await self._pm2_jlist_map()
+
+        async def _ensure(name, deploy_path, port, label, fqdn=None):
+            proc = pm2_map.get(name)
+            status = (proc.get('pm2_env', {}) or {}).get('status') if proc else None
+            if status == 'online':
+                report.append({'target': label, 'pm2_name': name, 'ok': True, 'detail': 'already online'})
+                return
+            # Fall back to the port nginx is actually proxying to if the row didn't carry one.
+            if not port:
+                port = await self._port_from_sites_available(fqdn)
+            ok, msg = await self.control_process(name, 'start', deploy_path=deploy_path, port=port)
+            report.append({'target': label, 'pm2_name': name, 'ok': ok, 'detail': msg})
+
+        for d in await get_active_deployments():
+            if d.get('tech_stack') == 'node':
+                fqdn = fqdn_of(d)
+                await _ensure(d.get('pm2_name') or d['deployment_uuid'][:12],
+                              d.get('deploy_path'), d.get('assigned_port'), fqdn, fqdn=fqdn)
+        for s in await get_all_managed_services(enabled_only=True):
+            if s.get('service_type') == 'pm2':
+                await _ensure(s.get('pm2_name') or s.get('name'),
+                              s.get('deploy_path'), s.get('port'), s.get('name'), fqdn=s.get('fqdn'))
+
+        # Persist so a reboot can restore (pair with `pm2 startup` on the box, one-time).
+        await self.run_exec(['pm2', 'save'], timeout=30)
+        recovered = sum(1 for r in report if r['ok'] and r['detail'] != 'already online')
+        if recovered:
+            await self._notify('warning', 'Service recovery',
+                               f"Recovered {recovered} process(es) via control plane.",
+                               source='control', critical=True)
+        return report
 
     async def control_nginx(self, action: str, fqdn: str = None) -> tuple[bool, str]:
         """nginx control: test / reload / enable|disable a site."""
@@ -698,26 +870,32 @@ class DeploymentCog(commands.Cog):
                            source='control', target=fqdn)
         return True, (out or '').strip()
 
-    async def reconcile_dns(self, subdomain: str) -> tuple[bool, str]:
+    async def reconcile_dns(self, deployment: dict) -> tuple[bool, str]:
         """Force the Cloudflare A record back to the correct IP + proxied state."""
+        if (deployment.get('dns_mode') or 'subdomain') == 'external':
+            return False, "DNS is client-managed for external-DNS deployments; nothing to reconcile."
         cf = self.bot.get_cog('CloudflareCog')
         if not cf:
             return False, "CloudflareCog unavailable"
-        fqdn = f"{subdomain}.{_DOMAIN}"
+        fqdn = fqdn_of(deployment)
+        zone_id = _cf_zone_of(deployment)
+        # Record name: bare subdomain in the managed zone (legacy); full fqdn in a client zone.
+        record_name = (deployment.get('subdomain')
+                       if (deployment.get('dns_mode') or 'subdomain') == 'subdomain' else fqdn)
         try:
-            data, _ = await cf.list_dns_records(type='A', name=fqdn)
+            data, _ = await cf.list_dns_records(type='A', name=fqdn, zone_id=zone_id)
         except Exception as e:
             return False, str(e)
         rec = (data or [None])[0]
         if rec:
             _, err = await cf.update_dns_record(
-                record_id=rec['id'], type='A', name=subdomain, content=_SERVER_IP,
-                ttl=1, proxied=True, comment="nydus | dns reconcile",
+                record_id=rec['id'], type='A', name=record_name, content=_SERVER_IP,
+                ttl=1, proxied=True, comment="nydus | dns reconcile", zone_id=zone_id,
             )
         else:
             _, err = await cf.create_dns_record(
-                type='A', name=subdomain, content=_SERVER_IP, ttl=1, proxied=True,
-                comment="nydus | dns reconcile",
+                type='A', name=record_name, content=_SERVER_IP, ttl=1, proxied=True,
+                comment="nydus | dns reconcile", zone_id=zone_id,
             )
         if err:
             return False, err
@@ -839,7 +1017,8 @@ class DeploymentCog(commands.Cog):
 
         async def _one(d):
             subdomain = d.get('subdomain')
-            fqdn = f"{subdomain}.{_DOMAIN}"
+            fqdn = fqdn_of(d)
+            dns_mode = d.get('dns_mode') or 'subdomain'
             stack = d.get('tech_stack')
             pm2_name = d.get('pm2_name') or (d.get('deployment_uuid') or '')[:12]
             pm2_info = None
@@ -856,16 +1035,22 @@ class DeploymentCog(commands.Cog):
                     }
             async with sem:
                 http = await self._http_health(fqdn)
-            rec = dns_map.get(fqdn)
-            dns = {
-                'present': bool(rec),
-                'content': rec.get('content') if rec else None,
-                'proxied': rec.get('proxied') if rec else None,
-                'drift': (not rec) or rec.get('content') != _SERVER_IP,
-            }
+            # The bulk dns_map only covers the managed arvo.team zone, so it's only valid for
+            # subdomain mode. Custom domains (other/no Cloudflare zone) are reported as
+            # unmanaged here to avoid false "drift" — their DNS is checked per-row elsewhere.
+            if dns_mode == 'subdomain':
+                rec = dns_map.get(fqdn)
+                dns = {
+                    'present': bool(rec),
+                    'content': rec.get('content') if rec else None,
+                    'proxied': rec.get('proxied') if rec else None,
+                    'drift': (not rec) or rec.get('content') != _SERVER_IP,
+                }
+            else:
+                dns = {'managed': False}
             return {
                 'deployment_uuid': d.get('deployment_uuid'),
-                'subdomain': subdomain, 'fqdn': fqdn, 'stack': stack,
+                'subdomain': subdomain, 'fqdn': fqdn, 'dns_mode': dns_mode, 'stack': stack,
                 'status': d.get('status'), 'pm2': pm2_info, 'http': http,
                 'ssl': {'days_left': cert_map.get(fqdn)}, 'dns': dns,
                 'assigned_port': d.get('assigned_port'),
@@ -880,11 +1065,14 @@ class DeploymentCog(commands.Cog):
         pat: str,
         triggered_by: str,
         cert_staging: bool = False,
+        domain: str = None,
+        dns_mode: str = 'subdomain',
     ) -> str:
         run_id = str(uuid_lib.uuid4())
         self._active_streams[run_id] = asyncio.Queue()
         asyncio.create_task(
-            self._run_and_cleanup(run_id, project_data, subdomain, pat, triggered_by, cert_staging)
+            self._run_and_cleanup(run_id, project_data, subdomain, pat, triggered_by,
+                                  cert_staging, domain, dns_mode)
         )
         return run_id
 
@@ -896,9 +1084,12 @@ class DeploymentCog(commands.Cog):
         pat: str,
         triggered_by: str,
         cert_staging: bool = False,
+        domain: str = None,
+        dns_mode: str = 'subdomain',
     ):
         try:
-            await self.deploy_project(run_id, project_data, subdomain, pat, triggered_by, cert_staging)
+            await self.deploy_project(run_id, project_data, subdomain, pat, triggered_by,
+                                      cert_staging, domain, dns_mode)
         except Exception as e:
             self.logger.exception(f"Unhandled deploy error [{run_id}]: {e}")
             q = self._active_streams.get(run_id)
@@ -935,6 +1126,8 @@ class DeploymentCog(commands.Cog):
         pat: str,
         triggered_by: str,
         cert_staging: bool = False,
+        domain: str = None,
+        dns_mode: str = 'subdomain',
     ):
         log_lines: list[str] = []
         loop = asyncio.get_running_loop()
@@ -953,6 +1146,7 @@ class DeploymentCog(commands.Cog):
             'nginx_config':  None,
             'nginx_symlink': None,
             'cf_record_id':  None,
+            'cf_zone_id':    None,
             'pm2_name':      None,
             'cert_name':     None,
             'deployment_uuid': None,
@@ -976,8 +1170,14 @@ class DeploymentCog(commands.Cog):
                 raise DeployError(f"Branch '{branch}' not found and could not detect default.")
         await emit("[GIT] Branch exists.")
 
-        fqdn         = f"{subdomain}.{_DOMAIN}"
-        deploy_path  = os.path.join(_DEPLOY_BASE, subdomain)
+        # Identity by dns_mode. subdomain mode keeps the exact legacy paths (parity);
+        # custom modes key everything on the full fqdn (dots in /var/www are fine).
+        if dns_mode == 'subdomain':
+            fqdn         = f"{subdomain}.{_DOMAIN}"
+            deploy_path  = os.path.join(_DEPLOY_BASE, subdomain)
+        else:
+            fqdn         = domain
+            deploy_path  = os.path.join(_DEPLOY_BASE, fqdn)
 
         cleanup['deploy_path']   = deploy_path
         nginx_config_path        = os.path.join(_NGINX_AVAILABLE, fqdn)
@@ -992,7 +1192,13 @@ class DeploymentCog(commands.Cog):
 
             async with lock:
                 try:
-                    valid, reason = validate_subdomain(subdomain)
+                    if dns_mode == 'subdomain':
+                        valid, reason = validate_subdomain(subdomain)
+                    else:
+                        if not domain:
+                            await emit("[FAIL] A custom domain is required for this dns_mode.")
+                            raise DeployError("Missing custom domain.")
+                        valid, reason = validate_domain(fqdn)
                     if not valid:
                         await emit(f"[FAIL] {reason}")
                         raise DeployError(reason)
@@ -1001,18 +1207,20 @@ class DeploymentCog(commands.Cog):
                         await emit("[FAIL] SERVER_IP is not configured.")
                         raise DeployError("SERVER_IP not set.")
 
-                    live = await get_live_deployment_by_subdomain(subdomain)
+                    # fqdn is the canonical identity across all modes, so preflight/reclaim
+                    # key on it (the subdomain lookups only cover *.arvo.team rows).
+                    live = await get_live_deployment_by_fqdn(fqdn)
                     if live:
                         await emit(
-                            f"[FAIL] Subdomain '{subdomain}' is already in use by a live "
+                            f"[FAIL] '{fqdn}' is already in use by a live "
                             f"deployment (status: {live['status']}). Use rebuild instead."
                         )
-                        raise DeployError("Subdomain already in use.")
+                        raise DeployError("Domain already in use.")
 
                     # No live owner: clear any remnants from a prior failed/deleted/crashed
                     # deploy so this attempt starts clean (prevents the "already in use"
                     # blocker, duplicate Cloudflare records, and leaked ports).
-                    await self._reclaim_subdomain(subdomain, run_id, log_lines, pat)
+                    await self._reclaim_target(fqdn, deploy_path, run_id, log_lines, pat)
 
                     await emit("[CHECK] Pre-flight passed.")
 
@@ -1280,13 +1488,15 @@ class DeploymentCog(commands.Cog):
                     await emit("[DB] Saving deployment record...")
                     deployment_uuid = await create_deployment(
                         project_uuid=project_uuid,
-                        subdomain=subdomain,
+                        subdomain=subdomain if dns_mode == 'subdomain' else None,
                         tech_stack=stack,
                         assigned_port=None,
                         deploy_path=deploy_path,
                         env_file_name=env_file_name,
                         deployed_by=triggered_by,
                         branch=branch,
+                        fqdn=fqdn,
+                        dns_mode=dns_mode,
                     )
                     cleanup['deployment_uuid'] = deployment_uuid
 
@@ -1379,56 +1589,93 @@ class DeploymentCog(commands.Cog):
                         raise DeployError("nginx reload failed (HTTP).")
                     await emit("[NGINX] nginx reloaded with HTTP config.")
 
-                    await emit(f"[DNS] Creating DNS A record for {fqdn} (unproxied)...")
-
                     cf_cog = self.bot.get_cog('CloudflareCog')
-                    if not cf_cog:
-                        await emit("[FAIL] CloudflareCog is not loaded.")
-                        raise DeployError("CloudflareCog unavailable.")
+                    cf_record = None          # set for subdomain/cloudflare; None for external
+                    cf_zone_id = None         # client zone for cloudflare; None → managed zone
 
-                    cf_record, cf_error = await cf_cog.create_dns_record(
-                        type='A',
-                        name=subdomain,
-                        content=_SERVER_IP,
-                        ttl=60,
-                        proxied=False,
-                        comment=f"nydus | run={run_id}",
-                    )
-                    if cf_error:
-                        await emit(f"[FAIL] Cloudflare DNS error: {cf_error}")
-                        raise DeployError(f"Cloudflare DNS failed: {cf_error}")
-
-                    cleanup['cf_record_id'] = cf_record['id']
-                    await update_deployment(deployment_uuid, cf_record_id=cf_record['id'])
-                    await emit(f"[DNS] Record created (unproxied). ID: {cf_record['id']}")
-
-                    await emit(
-                        f"[DNS] Waiting for propagation "
-                        f"(up to {int(_DNS_RETRIES * _DNS_DELAY)}s)..."
-                    )
-                    
-                    # Create a task for DNS propagation check
-                    propagation_task = asyncio.create_task(
-                        check_dns_propagated(fqdn, _SERVER_IP, _DNS_RETRIES, _DNS_DELAY)
-                    )
-                    
-                    # Keep-alive pings while waiting (without logging)
-                    q = self._active_streams.get(run_id)
-                    while not propagation_task.done():
-                        try:
-                            await asyncio.wait_for(asyncio.shield(propagation_task), timeout=15)
-                        except asyncio.TimeoutError:
-                            if q:
-                                await q.put("[DNS] Still waiting for propagation...")
-                    
-                    propagated = propagation_task.result()
-                    if propagated:
-                        await emit("[DNS] DNS propagated successfully.")
-                    else:
+                    if dns_mode == 'external':
+                        # Client runs DNS elsewhere. We create nothing; instead we REQUIRE the
+                        # domain to already resolve to this server before certbot, so an
+                        # unpointed domain fails cheaply instead of burning a Let's Encrypt
+                        # failure against the rate limit.
                         await emit(
-                            "[DNS] Propagation check timed out. "
-                            "Proceeding anyway; certbot may fail."
+                            f"[DNS] External DNS mode: verifying {fqdn} resolves to {_SERVER_IP} "
+                            f"(up to {int(_DNS_RETRIES * _DNS_DELAY)}s)..."
                         )
+                        propagation_task = asyncio.create_task(
+                            check_dns_propagated(fqdn, _SERVER_IP, _DNS_RETRIES, _DNS_DELAY)
+                        )
+                        q = self._active_streams.get(run_id)
+                        while not propagation_task.done():
+                            try:
+                                await asyncio.wait_for(asyncio.shield(propagation_task), timeout=15)
+                            except asyncio.TimeoutError:
+                                if q:
+                                    await q.put("[DNS] Still waiting for the A record to point here...")
+                        if not propagation_task.result():
+                            await emit(
+                                f"[FAIL] {fqdn} does not resolve to {_SERVER_IP}. Point an A "
+                                f"record at {_SERVER_IP} with your DNS provider, then redeploy."
+                            )
+                            raise DeployError("Custom domain does not resolve to this server yet.")
+                        await emit("[DNS] Domain resolves to this server.")
+                    else:
+                        if not cf_cog:
+                            await emit("[FAIL] CloudflareCog is not loaded.")
+                            raise DeployError("CloudflareCog unavailable.")
+
+                        # cloudflare mode: resolve the client's zone; subdomain mode: managed zone.
+                        if dns_mode == 'cloudflare':
+                            cf_zone_id, zone_err = await cf_cog.get_zone_id_for_domain(fqdn)
+                            if zone_err:
+                                await emit(f"[FAIL] {zone_err}")
+                                raise DeployError(zone_err)
+                            cleanup['cf_zone_id'] = cf_zone_id
+                            await update_deployment(deployment_uuid, cf_zone_id=cf_zone_id)
+                            await emit(f"[DNS] Resolved Cloudflare zone {cf_zone_id} for {fqdn}.")
+
+                        # Record name: bare subdomain in the managed zone (legacy); full fqdn in
+                        # a client zone (Cloudflare accepts the full name for apex and sub).
+                        record_name = subdomain if dns_mode == 'subdomain' else fqdn
+                        await emit(f"[DNS] Creating DNS A record for {fqdn} (unproxied)...")
+                        cf_record, cf_error = await cf_cog.create_dns_record(
+                            type='A',
+                            name=record_name,
+                            content=_SERVER_IP,
+                            ttl=60,
+                            proxied=False,
+                            comment=f"nydus | run={run_id}",
+                            zone_id=cf_zone_id,
+                        )
+                        if cf_error:
+                            await emit(f"[FAIL] Cloudflare DNS error: {cf_error}")
+                            raise DeployError(f"Cloudflare DNS failed: {cf_error}")
+
+                        cleanup['cf_record_id'] = cf_record['id']
+                        await update_deployment(deployment_uuid, cf_record_id=cf_record['id'])
+                        await emit(f"[DNS] Record created (unproxied). ID: {cf_record['id']}")
+
+                        await emit(
+                            f"[DNS] Waiting for propagation "
+                            f"(up to {int(_DNS_RETRIES * _DNS_DELAY)}s)..."
+                        )
+                        propagation_task = asyncio.create_task(
+                            check_dns_propagated(fqdn, _SERVER_IP, _DNS_RETRIES, _DNS_DELAY)
+                        )
+                        q = self._active_streams.get(run_id)
+                        while not propagation_task.done():
+                            try:
+                                await asyncio.wait_for(asyncio.shield(propagation_task), timeout=15)
+                            except asyncio.TimeoutError:
+                                if q:
+                                    await q.put("[DNS] Still waiting for propagation...")
+                        if propagation_task.result():
+                            await emit("[DNS] DNS propagated successfully.")
+                        else:
+                            await emit(
+                                "[DNS] Propagation check timed out. "
+                                "Proceeding anyway; certbot may fail."
+                            )
 
                     staging_note = " (staging)" if cert_staging else ""
                     await emit(f"[SSL] Obtaining Let's Encrypt certificate for {fqdn}{staging_note}...")
@@ -1483,23 +1730,26 @@ class DeploymentCog(commands.Cog):
                         raise DeployError("nginx reload failed (SSL).")
                     await emit("[NGINX] nginx reloaded with SSL config.")
 
-                    await emit("[DNS] Enabling Cloudflare proxy on DNS record...")
-                    _, cf_upd_err = await cf_cog.update_dns_record(
-                        record_id=cf_record['id'],
-                        type='A',
-                        name=subdomain,
-                        content=_SERVER_IP,
-                        ttl=1,
-                        proxied=True,
-                        comment=f"nydus | run={run_id}",
-                    )
-                    if cf_upd_err:
-                        await emit(
-                            f"[WARN] Could not enable Cloudflare proxy: {cf_upd_err}. "
-                            "Site is live but not proxied yet."
+                    if dns_mode != 'external' and cf_record:
+                        await emit("[DNS] Enabling Cloudflare proxy on DNS record...")
+                        record_name = subdomain if dns_mode == 'subdomain' else fqdn
+                        _, cf_upd_err = await cf_cog.update_dns_record(
+                            record_id=cf_record['id'],
+                            type='A',
+                            name=record_name,
+                            content=_SERVER_IP,
+                            ttl=1,
+                            proxied=True,
+                            comment=f"nydus | run={run_id}",
+                            zone_id=cf_zone_id,
                         )
-                    else:
-                        await emit("[DNS] Cloudflare proxy enabled.")
+                        if cf_upd_err:
+                            await emit(
+                                f"[WARN] Could not enable Cloudflare proxy: {cf_upd_err}. "
+                                "Site is live but not proxied yet."
+                            )
+                        else:
+                            await emit("[DNS] Cloudflare proxy enabled.")
 
                     pm2_name = deployment_uuid[:12]
                     if stack == 'node':
@@ -1731,32 +1981,32 @@ class DeploymentCog(commands.Cog):
                 source='deploy', critical=True,
             )
 
-    async def _reclaim_subdomain(
-        self, subdomain: str, run_id: str, log_lines: list, pat: str = ''
+    async def _reclaim_target(
+        self, fqdn: str, deploy_path: str, run_id: str, log_lines: list, pat: str = ''
     ):
         """
-        Tear down leftovers for a subdomain that has no live deployment, so a fresh deploy
+        Tear down leftovers for an fqdn that has no live deployment, so a fresh deploy
         starts clean. Best-effort and idempotent: each step is independent and logged.
-        Only call this when get_live_deployment_by_subdomain() returned nothing.
+        Only call this when get_live_deployment_by_fqdn() returned nothing. Works for all
+        dns_modes — fqdn is the canonical identity and deploy_path is passed in (it differs
+        between subdomain mode `/var/www/{subdomain}` and custom mode `/var/www/{fqdn}`).
         """
         loop = asyncio.get_running_loop()
 
         async def emit(line: str):
             await self._emit(run_id, log_lines, line, pat)
 
-        fqdn               = f"{subdomain}.{_DOMAIN}"
-        deploy_path        = os.path.join(_DEPLOY_BASE, subdomain)
         nginx_config_path  = os.path.join(_NGINX_AVAILABLE, fqdn)
         nginx_symlink_path = os.path.join(_NGINX_ENABLED, fqdn)
 
-        stale         = await get_deployments_by_subdomain(subdomain)
+        stale         = await get_deployments_by_fqdn(fqdn)
         dir_exists    = await loop.run_in_executor(None, os.path.exists, deploy_path)
         config_exists = await loop.run_in_executor(None, os.path.exists, nginx_config_path)
 
         if not stale and not dir_exists and not config_exists:
             return  # nothing to reclaim
 
-        await emit(f"[RECLAIM] Clearing remnants for '{subdomain}'...")
+        await emit(f"[RECLAIM] Clearing remnants for '{fqdn}'...")
 
         # pm2 processes for each stale row
         for d in stale:
@@ -1774,21 +2024,35 @@ class DeploymentCog(commands.Cog):
                     pass
         await loop.run_in_executor(None, _rm_nginx)
 
-        # Cloudflare records: stored ids first, then a name lookup for any the row didn't
-        # capture (crash before persist), so no duplicate A record is left behind.
+        # Cloudflare records: delete each stale row's record in ITS zone (subdomain rows have
+        # cf_zone_id=None → managed zone), then a name-lookup fallback for any the row didn't
+        # capture (crash before persist). We can only run the fallback against a zone we can
+        # identify: the managed zone (fqdn under _DOMAIN) or a custom zone a stale row recorded.
         cf_cog = self.bot.get_cog('CloudflareCog')
         if cf_cog:
-            record_ids = {d['cf_record_id'] for d in stale if d.get('cf_record_id')}
-            try:
-                data, _ = await cf_cog.list_dns_records(type='A', name=fqdn)
-                for rec in (data or []):
-                    if rec.get('id'):
-                        record_ids.add(rec['id'])
-            except Exception:
-                pass
-            for rid in record_ids:
+            for d in stale:
+                rid = d.get('cf_record_id')
+                if rid:
+                    try:
+                        await cf_cog.delete_dns_record(rid, zone_id=d.get('cf_zone_id'))
+                    except Exception:
+                        pass
+            fallback_zone, do_fallback = None, False
+            if fqdn == _DOMAIN or fqdn.endswith('.' + _DOMAIN):
+                do_fallback = True  # managed zone (zone_id=None)
+            else:
+                zones = {d.get('cf_zone_id') for d in stale if d.get('cf_zone_id')}
+                if len(zones) == 1:
+                    fallback_zone, do_fallback = next(iter(zones)), True
+            if do_fallback:
                 try:
-                    await cf_cog.delete_dns_record(rid)
+                    data, _ = await cf_cog.list_dns_records(type='A', name=fqdn, zone_id=fallback_zone)
+                    for rec in (data or []):
+                        if rec.get('id'):
+                            try:
+                                await cf_cog.delete_dns_record(rec['id'], zone_id=fallback_zone)
+                            except Exception:
+                                pass
                 except Exception:
                     pass
 
@@ -1807,9 +2071,9 @@ class DeploymentCog(commands.Cog):
                     pass
             await loop.run_in_executor(None, _rm_dir)
 
-        # Hard-delete stale rows. deployments.subdomain is UNIQUE, so a leftover row
-        # (even 'failed') would block the new deploy's INSERT; removing it frees the
-        # subdomain and its port. Audit history remains in deployment_logs (no FK).
+        # Hard-delete stale rows. deployments.fqdn is UNIQUE, so a leftover row (even 'failed')
+        # would block the new deploy's INSERT; removing it frees the host and its port. Audit
+        # history remains in deployment_logs (no FK).
         for d in stale:
             await delete_deployment_row(d['deployment_uuid'])
 
@@ -1881,7 +2145,9 @@ class DeploymentCog(commands.Cog):
             await emit(f"[CLEANUP] Deleting Cloudflare DNS record {cleanup['cf_record_id']}...")
             cf_cog = self.bot.get_cog('CloudflareCog')
             if cf_cog:
-                ok, err = await cf_cog.delete_dns_record(cleanup['cf_record_id'])
+                ok, err = await cf_cog.delete_dns_record(
+                    cleanup['cf_record_id'], zone_id=cleanup.get('cf_zone_id')
+                )
                 if ok:
                     await emit("[CLEANUP] DNS record deleted.")
                 else:
@@ -1927,7 +2193,7 @@ class DeploymentCog(commands.Cog):
         if not deployment:
             return False, "Deployment not found."
 
-        fqdn = f"{deployment['subdomain']}.{_DOMAIN}"
+        fqdn = fqdn_of(deployment)
         loop = asyncio.get_running_loop()
 
         if deployment['tech_stack'] == 'node' and deployment['assigned_port']:
@@ -1954,7 +2220,9 @@ class DeploymentCog(commands.Cog):
 
         cf_cog = self.bot.get_cog('CloudflareCog')
         if cf_cog and deployment.get('cf_record_id'):
-            await cf_cog.delete_dns_record(deployment['cf_record_id'])
+            await cf_cog.delete_dns_record(
+                deployment['cf_record_id'], zone_id=_cf_zone_of(deployment)
+            )
 
         await self.run_exec(
             ['sudo', 'certbot', 'delete', '--cert-name', fqdn, '--non-interactive'],
@@ -2412,7 +2680,7 @@ class DeploymentCog(commands.Cog):
                                         raise DeployError("Artisan command failed.")
 
                     await emit("[REBUILD] Performing health check...")
-                    fqdn = f"{deployment['subdomain']}.{_DOMAIN}"
+                    fqdn = fqdn_of(deployment)
                     health_ok = await self._http_health_check(fqdn, emit)
 
                     if health_ok:
@@ -2449,7 +2717,7 @@ class DeploymentCog(commands.Cog):
                 await update_deployment_log(
                     run_id, 'success' if success else 'failed', full_log
                 )
-                fqdn = f"{deployment['subdomain']}.{_DOMAIN}"
+                fqdn = fqdn_of(deployment)
                 if success and rolled_back:
                     await self._notify(
                         'warning', 'Rebuild reverted',

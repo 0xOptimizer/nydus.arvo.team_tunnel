@@ -110,7 +110,13 @@ class MaintenanceCog(commands.Cog):
             if not dep:
                 return False, "DeploymentCog unavailable"
             name = service.get('pm2_name') or service.get('name')
-            return await dep.control_process(name, action)
+            # Pass the service's dedicated port + path so a lost process is recreated
+            # correctly (e.g. arvo.team on 3001), not just "process not found".
+            return await dep.control_process(
+                name, action,
+                deploy_path=service.get('deploy_path'),
+                port=service.get('port'),
+            )
 
         if stype == 'systemd':
             unit = service.get('systemd_unit')
@@ -142,6 +148,29 @@ class MaintenanceCog(commands.Cog):
         if stype == 'nginx':
             return f"tail -n {lines} -F /var/log/nginx/error.log"
         return None
+
+    async def service_diagnostics(self, service: dict, lines: int = 120):
+        """Why a managed service is unhealthy — useful even when it's down (the live log tail
+        is empty then). pm2 → process state + persisted stderr; systemd → status + recent
+        journal; nginx/static → recent nginx errors."""
+        stype = service.get('service_type')
+        dep = self.bot.get_cog('DeploymentCog')
+        if stype == 'pm2':
+            if not dep:
+                return {'service_type': 'pm2', 'error': 'DeploymentCog unavailable'}
+            name = service.get('pm2_name') or service.get('name')
+            return {'service_type': 'pm2', 'process': await dep.get_process_diagnostics(name, lines)}
+        if stype == 'systemd':
+            unit = service.get('systemd_unit')
+            if not unit:
+                return {'service_type': 'systemd', 'error': 'no systemd_unit configured'}
+            _, status = await self._run_command(f"systemctl status {unit} --no-pager -n {lines}")
+            _, journal = await self._run_command(f"journalctl -u {unit} -n {lines} --no-pager")
+            return {'service_type': 'systemd', 'unit': unit, 'status': status, 'journal': journal}
+        if stype in ('nginx', 'static'):
+            tail = await dep._tail('/var/log/nginx/error.log', lines) if dep else None
+            return {'service_type': stype, 'nginx_error_log': tail}
+        return {'service_type': stype, 'error': 'no diagnostics for this service type'}
 
 
 def setup(bot):

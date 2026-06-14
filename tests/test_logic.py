@@ -144,6 +144,67 @@ check("wrong secret rejected", not _verify(_secret, _body, _sign('not-the-secret
 check("tampered body rejected", not _verify(_secret, _body + b'x', _sign(_secret, _body)))
 check("missing signature rejected", not _verify(_secret, _body, None))
 
+# --- custom domains: validate_domain (real shipped code) ----------------------
+os.environ['DEPLOY_DOMAIN'] = 'arvo.team'  # make the managed-domain check deterministic
+from utils.validators import validate_domain
+
+print("validate_domain:")
+check("accepts sub of custom", validate_domain("shop.client.com")[0] is True)
+check("accepts apex custom", validate_domain("client.com")[0] is True)
+check("rejects bare label", validate_domain("client")[0] is False)
+check("rejects trailing dot", validate_domain("client.com.")[0] is False)
+check("rejects uppercase", validate_domain("Client.com")[0] is False)
+check("rejects leading-hyphen label", validate_domain("-x.client.com")[0] is False)
+check("rejects wildcard", validate_domain("*.client.com")[0] is False)
+check("rejects >253 chars", validate_domain(("a" * 60 + ".") * 5 + "com")[0] is False)
+check("rejects under managed domain", validate_domain("foo.arvo.team")[0] is False)
+check("rejects managed apex", validate_domain("arvo.team")[0] is False)
+
+# --- custom domains: fqdn_of + pick_zone_for_fqdn (real shipped code) ---------
+from utils.domains import fqdn_of, pick_zone_for_fqdn
+
+print("fqdn_of:")
+check("prefers stored fqdn", fqdn_of({'fqdn': 'shop.client.com', 'subdomain': 'x'}) == 'shop.client.com')
+check("falls back to subdomain", fqdn_of({'subdomain': 'foo'}) == 'foo.arvo.team')
+
+print("pick_zone_for_fqdn:")
+_zones = [{'id': 'z1', 'name': 'client.com'}, {'id': 'z2', 'name': 'other.com'}]
+check("sub matches its zone", pick_zone_for_fqdn('shop.client.com', _zones)['id'] == 'z1')
+check("apex matches its zone", pick_zone_for_fqdn('client.com', _zones)['id'] == 'z1')
+check("longest suffix wins",
+      pick_zone_for_fqdn('a.shop.client.com',
+                         [{'id': 'z1', 'name': 'client.com'}, {'id': 'z3', 'name': 'shop.client.com'}])['id'] == 'z3')
+check("label-boundary only (no substring match)", pick_zone_for_fqdn('notclient.com', _zones) is None)
+check("no match -> None", pick_zone_for_fqdn('example.org', _zones) is None)
+
+# --- custom domains: deploy required-field rule (mirrors handle_deploy) -------
+def deploy_fields_ok(dns_mode, subdomain, domain):
+    if dns_mode not in ('subdomain', 'cloudflare', 'external'):
+        return False
+    return bool(subdomain) if dns_mode == 'subdomain' else bool(domain)
+
+print("deploy field rule (subdomain XOR domain):")
+check("subdomain mode needs subdomain", deploy_fields_ok('subdomain', 'myapp', None) is True)
+check("subdomain mode rejects missing", deploy_fields_ok('subdomain', None, 'x.com') is False)
+check("cloudflare mode needs domain", deploy_fields_ok('cloudflare', None, 'shop.client.com') is True)
+check("external mode needs domain", deploy_fields_ok('external', None, 'client.com') is True)
+check("custom mode rejects missing domain", deploy_fields_ok('cloudflare', 'myapp', None) is False)
+check("unknown mode rejected", deploy_fields_ok('bogus', 'myapp', 'x.com') is False)
+
+# --- watchdog alert gate (mirrors MonitoringCog._alerts_active) ----------------
+def alerts_active(enabled, age, grace):
+    if not enabled:
+        return False
+    if age is not None and age < grace:
+        return False
+    return True
+
+print("watchdog alert gate:")
+check("disabled -> no alerts", alerts_active(False, 10_000, 300) is False)
+check("enabled but in startup grace -> suppressed", alerts_active(True, 10, 300) is False)
+check("enabled and past grace -> alerts", alerts_active(True, 400, 300) is True)
+check("enabled, never started -> alerts", alerts_active(True, None, 300) is True)
+
 print()
 if failures:
     print(f"{len(failures)} CHECK(S) FAILED: {failures}")

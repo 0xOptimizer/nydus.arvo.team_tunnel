@@ -206,17 +206,24 @@ async def get_webhook_project_by_subdomain(subdomain):
         fetch_one=True
     )
 
-async def create_new_webhook_project(name, repo_url, branch, tech_stack, subdomain, cloudflare_id, nginx_port):
+async def get_webhook_project_by_fqdn(fqdn):
+    return await execute_query(
+        "SELECT * FROM webhook_projects WHERE fqdn = %s ORDER BY id DESC LIMIT 1",
+        (fqdn,),
+        fetch_one=True
+    )
+
+async def create_new_webhook_project(name, repo_url, branch, tech_stack, subdomain, cloudflare_id, nginx_port, fqdn=None):
     new_uuid = str(uuid.uuid4())
     new_secret = secrets.token_hex(16)
     deploy_path = f"/var/www/{new_uuid}"
-    
-    query = """INSERT INTO webhook_projects 
-               (webhook_uuid, project_name, github_repository_url, branch, deploy_path, tech_stack, webhook_secret, subdomain, cloudflare_record_id, nginx_port) 
-               VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)"""
-    
-    params = (new_uuid, name, repo_url, branch, deploy_path, tech_stack, new_secret, subdomain, cloudflare_id, nginx_port)
-    
+
+    query = """INSERT INTO webhook_projects
+               (webhook_uuid, project_name, github_repository_url, branch, deploy_path, tech_stack, webhook_secret, subdomain, fqdn, cloudflare_record_id, nginx_port)
+               VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)"""
+
+    params = (new_uuid, name, repo_url, branch, deploy_path, tech_stack, new_secret, subdomain, fqdn, cloudflare_id, nginx_port)
+
     result = await execute_query(query, params)
     
     if result:
@@ -943,16 +950,21 @@ async def create_deployment(
     env_file_name: str,
     deployed_by: str,
     branch: str = 'main',
+    fqdn: str = None,
+    dns_mode: str = 'subdomain',
+    cf_zone_id: str = None,
 ) -> str:
     deployment_uuid = str(uuid.uuid4())
+    # This is the sole INSERT path for deployments, so it always populates `fqdn` (the
+    # canonical hostname). subdomain is NULL for custom-domain deployments.
     query = """
         INSERT INTO deployments
-        (deployment_uuid, project_uuid, subdomain, tech_stack, assigned_port,
-         deploy_path, env_file_name, status, deployed_by, deployed_at, branch)
-        VALUES (%s, %s, %s, %s, %s, %s, %s, 'pending', %s, NOW(), %s)
+        (deployment_uuid, project_uuid, subdomain, dns_mode, fqdn, cf_zone_id, tech_stack,
+         assigned_port, deploy_path, env_file_name, status, deployed_by, deployed_at, branch)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'pending', %s, NOW(), %s)
     """
-    params = (deployment_uuid, project_uuid, subdomain, tech_stack, assigned_port,
-              deploy_path, env_file_name, deployed_by, branch)
+    params = (deployment_uuid, project_uuid, subdomain, dns_mode, fqdn, cf_zone_id, tech_stack,
+              assigned_port, deploy_path, env_file_name, deployed_by, branch)
     # raise_on_error=True so a constraint/type failure surfaces the real DB message
     # to the deploy log instead of an opaque "Failed to create deployment record".
     result = await execute_query(query, params, raise_on_error=True)
@@ -1009,6 +1021,28 @@ async def get_deployments_by_subdomain(subdomain: str) -> list:
     """Return every deployment row for a subdomain (any status), newest first."""
     query = "SELECT * FROM deployments WHERE subdomain = %s ORDER BY deployed_at DESC"
     rows = await execute_query(query, (subdomain,), fetch_all=True)
+    return rows or []
+
+
+async def get_live_deployment_by_fqdn(fqdn: str) -> Optional[dict[str, any]]:
+    """Return a deployment for this fqdn only if one is genuinely live.
+
+    `fqdn` is the canonical identity across all dns_modes, so this is the preferred
+    preflight/webhook lookup (the subdomain version only covers *.arvo.team rows).
+    """
+    placeholders = ", ".join(["%s"] * len(LIVE_DEPLOYMENT_STATUSES))
+    query = (
+        f"SELECT * FROM deployments "
+        f"WHERE fqdn = %s AND status IN ({placeholders}) "
+        f"ORDER BY deployed_at DESC LIMIT 1"
+    )
+    return await execute_query(query, (fqdn, *LIVE_DEPLOYMENT_STATUSES), fetch_one=True)
+
+
+async def get_deployments_by_fqdn(fqdn: str) -> list:
+    """Return every deployment row for an fqdn (any status), newest first."""
+    query = "SELECT * FROM deployments WHERE fqdn = %s ORDER BY deployed_at DESC"
+    rows = await execute_query(query, (fqdn,), fetch_all=True)
     return rows or []
 
 

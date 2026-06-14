@@ -7,6 +7,8 @@ from typing import Optional, List, Dict, Any, Tuple
 from discord.ext import commands
 from collections import defaultdict
 
+from utils.domains import pick_zone_for_fqdn
+
 class CloudflareCog(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
@@ -15,8 +17,13 @@ class CloudflareCog(commands.Cog):
         self.base_url = "https://api.cloudflare.com/client/v4"
         self.logger = logging.getLogger('nydus')
 
-    async def _make_request(self, method: str, endpoint: str, json: dict = None, params: dict = None) -> Tuple[Optional[Any], Optional[str]]:
-        url = f"{self.base_url}/zones/{self.zone_id}/{endpoint}"
+    async def _make_request(self, method: str, endpoint: str, json: dict = None, params: dict = None, zone_id: str = None, absolute: bool = False) -> Tuple[Optional[Any], Optional[str]]:
+        # absolute=True for account-scoped calls that are NOT under /zones/{id}/ (e.g. GET /zones).
+        # Otherwise scope to the given zone_id, defaulting to the managed arvo.team zone.
+        if absolute:
+            url = f"{self.base_url}/{endpoint}"
+        else:
+            url = f"{self.base_url}/zones/{zone_id or self.zone_id}/{endpoint}"
         headers = {
             "Authorization": f"Bearer {self.api_token}",
             "Content-Type": "application/json"
@@ -130,7 +137,10 @@ class CloudflareCog(commands.Cog):
         except (KeyError, IndexError) as e:
             return None, f"Data parsing error: {str(e)}"
 
-    async def list_dns_records(self, type: str = None, name: str = None, page: int = 1, per_page: int = 100) -> Tuple[Optional[List[Dict]], Optional[str]]:
+    # The four DNS methods accept an optional zone_id; when omitted they target the managed
+    # arvo.team zone (self.zone_id) exactly as before. Pass a client's zone_id for custom
+    # domains in `dns_mode='cloudflare'`.
+    async def list_dns_records(self, type: str = None, name: str = None, page: int = 1, per_page: int = 100, zone_id: str = None) -> Tuple[Optional[List[Dict]], Optional[str]]:
         params = {
             "page": page,
             "per_page": per_page,
@@ -141,10 +151,12 @@ class CloudflareCog(commands.Cog):
             params['type'] = type
         if name:
             params['name'] = name
-        return await self._make_request("GET", "dns_records", params=params)
+        return await self._make_request("GET", "dns_records", params=params, zone_id=zone_id)
 
-    async def create_dns_record(self, type: str, name: str, content: str, ttl: int = 1, proxied: bool = True, comment: str = "") -> Tuple[Optional[Dict], Optional[str]]:
-        if name.lower() == 'nydus':
+    async def create_dns_record(self, type: str, name: str, content: str, ttl: int = 1, proxied: bool = True, comment: str = "", zone_id: str = None) -> Tuple[Optional[Dict], Optional[str]]:
+        # The reserved-'nydus' guard only applies to the managed zone; a client's own zone
+        # may legitimately have a 'nydus' host.
+        if name.lower() == 'nydus' and (zone_id is None or zone_id == self.zone_id):
             return None, "Reserved subdomain."
         data = {
             "type": type,
@@ -154,9 +166,9 @@ class CloudflareCog(commands.Cog):
             "proxied": proxied,
             "comment": comment
         }
-        return await self._make_request("POST", "dns_records", json=data)
+        return await self._make_request("POST", "dns_records", json=data, zone_id=zone_id)
 
-    async def update_dns_record(self, record_id: str, type: str, name: str, content: str, ttl: int = 1, proxied: bool = True, comment: str = "") -> Tuple[Optional[Dict], Optional[str]]:
+    async def update_dns_record(self, record_id: str, type: str, name: str, content: str, ttl: int = 1, proxied: bool = True, comment: str = "", zone_id: str = None) -> Tuple[Optional[Dict], Optional[str]]:
         if not record_id:
             return None, "Record ID is required."
         data = {
@@ -167,15 +179,37 @@ class CloudflareCog(commands.Cog):
             "proxied": proxied,
             "comment": comment
         }
-        return await self._make_request("PUT", f"dns_records/{record_id}", json=data)
+        return await self._make_request("PUT", f"dns_records/{record_id}", json=data, zone_id=zone_id)
 
-    async def delete_dns_record(self, record_id: str) -> Tuple[bool, Optional[str]]:
+    async def delete_dns_record(self, record_id: str, zone_id: str = None) -> Tuple[bool, Optional[str]]:
         if not record_id:
             return False, "Record ID is required."
-        result, error = await self._make_request("DELETE", f"dns_records/{record_id}")
+        result, error = await self._make_request("DELETE", f"dns_records/{record_id}", zone_id=zone_id)
         if error:
             return False, error
         return True, None
+
+    async def get_zone_id_for_domain(self, fqdn: str) -> Tuple[Optional[str], Optional[str]]:
+        """
+        Resolve which Cloudflare zone (in this account) is authoritative for `fqdn`.
+
+        Used by custom-domain deployments (`dns_mode='cloudflare'`). Requires the API token
+        to have Zone:Read across the account — if it's scoped to only the arvo.team zone,
+        GET /zones returns just that zone and this returns a clear error for foreign domains.
+        """
+        # GET /zones is account-scoped, not under /zones/{id}/ — hence absolute=True.
+        result, error = await self._make_request(
+            "GET", "zones", params={"per_page": 50}, absolute=True
+        )
+        if error:
+            return None, error
+        zone = pick_zone_for_fqdn(fqdn, result or [])
+        if not zone:
+            return None, (
+                f"No Cloudflare zone in this account is authoritative for '{fqdn}'. "
+                "Add the domain to Cloudflare (same account/token) or use external DNS mode."
+            )
+        return zone.get('id'), None
 
     async def get_dynamic_analytics(self, days: int = 7) -> Tuple[Optional[Dict], Optional[str]]:
         """

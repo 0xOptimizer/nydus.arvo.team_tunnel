@@ -31,6 +31,7 @@ import logging
 import os
 import shutil
 import uuid as uuid_lib
+from datetime import datetime, timezone
 
 import aiohttp
 import discord
@@ -55,6 +56,10 @@ _SUBRUN_LINE_TIMEOUT = 600.0
 # How long the finished self-test stream lingers before cleanup, so a slightly
 # late SSE client can still attach and replay the [done] sentinel.
 _STREAM_LINGER = 90.0
+# Stale-lock takeover: if a run has "held" the single-flight lock longer than this, it's
+# presumed dead/stuck (its finally never ran) and a new run may take over. Generous so a
+# legitimately slow run is never pre-empted.
+_SELFTEST_LOCK_TTL = float(os.getenv('SELFTEST_LOCK_TTL', '2700'))  # 45 min
 
 # Canonical step order. Steps after 'node' operate on the node deployment, so
 # 'node' must run (and succeed) before rebuild/rollback/webhook.
@@ -126,22 +131,63 @@ class SelfTestCog(commands.Cog):
         self.logger = logging.getLogger('nydus')
         # Serialize runs: a self-test does heavy, real server work (pm2/nginx/
         # certbot) and floods the logs; one at a time keeps it legible and safe.
-        self._running = False
+        # Holds {run_id, started_by, started_at} for the live run, or None when idle —
+        # the single-flight lock shared by the slash command AND the API (one bot process,
+        # so this is global across all admins).
+        self._active = None
+
+    # ------------------------------------------------------------------
+    # Single-flight lock
+    # ------------------------------------------------------------------
+    def _active_busy(self) -> dict | None:
+        """Public info for the in-flight run if one genuinely holds the lock, else None.
+
+        Side effect: a lock older than _SELFTEST_LOCK_TTL is treated as stuck/dead and
+        released, so a crashed run (whose finally never reset it) can't wedge the feature.
+        """
+        a = self._active
+        if not a:
+            return None
+        age = (datetime.now(timezone.utc) - a['started_at']).total_seconds()
+        if age > _SELFTEST_LOCK_TTL:
+            self._active = None
+            return None
+        return {
+            'run_id': a['run_id'],
+            'started_by': a['started_by'],
+            'started_at': a['started_at'].isoformat(),
+            'age_seconds': int(age),
+            'log_stream': f"/api/deploy/logs/{a['run_id']}",
+        }
 
     # ------------------------------------------------------------------
     # Public entrypoint
     # ------------------------------------------------------------------
-    def queue_selftest(self, triggered_by: str, variants: list, cert_staging: bool = True):
-        """Register a stream and fire the run. Returns run_id, or None if busy /
-        the deployment module is unavailable."""
+    def queue_selftest(self, triggered_by: str, variants: list, cert_staging: bool = True) -> dict:
+        """Acquire the single-flight lock and fire a run.
+
+        Returns {'ok': True, 'run_id': ...} on success, or {'ok': False, 'reason': ...,
+        'message': ..., 'active'?: {...}} when busy or the deployment module is unavailable.
+        """
         dep = self.bot.get_cog('DeploymentCog')
-        if not dep or self._running:
-            return None
-        self._running = True
+        if not dep:
+            return {'ok': False, 'reason': 'unavailable',
+                    'message': 'Deployment module unavailable.'}
+        busy = self._active_busy()
+        if busy:
+            return {
+                'ok': False, 'reason': 'busy', 'active': busy,
+                'message': (f"A self-test is already running (started by {busy['started_by']}, "
+                            f"{busy['age_seconds']}s ago, run {busy['run_id']}). "
+                            "Watch that run instead of starting another."),
+            }
         run_id = str(uuid_lib.uuid4())
+        # Acquire synchronously (no await between check and set → race-free in one event loop).
+        self._active = {'run_id': run_id, 'started_by': str(triggered_by),
+                        'started_at': datetime.now(timezone.utc)}
         dep._active_streams[run_id] = asyncio.Queue()
         asyncio.create_task(self._run_selftest(run_id, triggered_by, variants, cert_staging))
-        return run_id
+        return {'ok': True, 'run_id': run_id}
 
     @staticmethod
     def parse_variants(value) -> list:
@@ -322,7 +368,10 @@ class SelfTestCog(commands.Cog):
             q = dep._active_streams.get(run_id)
             if q:
                 await q.put(None)
-            self._running = False
+            # Release the lock, but only if it's still ours — a stale-lock takeover may have
+            # already handed it to a newer run that we must not clobber.
+            if self._active and self._active.get('run_id') == run_id:
+                self._active = None
             await asyncio.sleep(_STREAM_LINGER)
             dep._active_streams.pop(run_id, None)
 
@@ -481,10 +530,14 @@ class SelfTestCog(commands.Cog):
                 await emit(f"[TEARDOWN] deployment {d['sub']} error: {e}")
         # Sweep any subdomain that never produced a tracked row (e.g. a deploy that
         # failed before persisting): idempotent reclaim clears stray nginx/DNS/cert/dir.
+        # Self-test fixtures are always subdomain mode → fqdn={sub}.DEPLOY_DOMAIN,
+        # deploy_path=/var/www/{sub}.
+        domain = os.getenv('DEPLOY_DOMAIN', 'arvo.team')
         for sub in created['subdomains']:
             try:
                 if not await get_live_deployment_by_subdomain(sub):
-                    await dep._reclaim_subdomain(sub, run_id, log_lines, '')
+                    await dep._reclaim_target(f"{sub}.{domain}", f"/var/www/{sub}",
+                                              run_id, log_lines, '')
             except Exception as e:
                 await emit(f"[TEARDOWN] reclaim {sub} error: {e}")
         for wh in created['webhooks']:
@@ -531,13 +584,15 @@ class SelfTestCog(commands.Cog):
             await ctx.respond("You are not authorized to use this command.", ephemeral=True)
             return
         await ctx.respond("Starting self-test...", ephemeral=True)
-        run_id = self.queue_selftest(str(ctx.author.id), self.parse_variants(variants), cert_staging=True)
-        if not run_id:
-            await ctx.send_followup(
-                "Could not start: a self-test is already running, or the deployment module is unavailable.",
-                ephemeral=True,
-            )
+        result = self.queue_selftest(str(ctx.author.id), self.parse_variants(variants), cert_staging=True)
+        if not result.get('ok'):
+            msg = result.get('message', 'Could not start self-test.')
+            active = result.get('active')
+            if active:
+                msg += f"\nWatch the active run with `/logs {active['run_id']}`."
+            await ctx.send_followup(msg, ephemeral=True)
             return
+        run_id = result['run_id']
         await ctx.send_followup(
             f"Self-test started. Run ID: `{run_id}`\n"
             f"Watch with `/logs {run_id}` or stream `GET /api/deploy/logs/{run_id}`.",
