@@ -45,31 +45,40 @@ class MonitoringCog(commands.Cog):
         self.cleanup_old_logs.start()
         self.watchdog.start()
 
-    async def _check_threshold(self, key, value, threshold, label):
+    async def _emit_alert(self, level, title, message, *, source, target, critical=False) -> bool:
+        """The single gate for EVERY monitoring alert — resource thresholds AND the service
+        watchdog. Emits (feed + Discord) only while watchdog alerting is active (toggled on AND
+        past the startup grace); otherwise sends nothing and returns False, so the caller leaves
+        its edge-state un-consumed and the condition re-surfaces once alerting is turned on.
+        Raw metrics (system_stats) and the live status/diagnostics endpoints are unaffected."""
+        if not self._alerts_active():
+            return False
         output = self.bot.get_cog('OutputCog')
+        if output:
+            try:
+                await output.alert(level, title, message, source=source, target=target, critical=critical)
+            except Exception:
+                logging.debug("monitoring alert emit failed", exc_info=True)
+        return True
+
+    async def _check_threshold(self, key, value, threshold, label):
         breached = value >= threshold
         was = self._alert_state.get(key, False)
         if breached and not was:
-            self._alert_state[key] = True
-            if output:
-                try:
-                    await output.alert(
-                        'warning', f"High {label}",
-                        f"{label} at {value:.0f}% (threshold {threshold:.0f}%).",
-                        source='monitor', target=label, critical=True,
-                    )
-                except Exception:
-                    pass
+            # Consume the edge only if we actually alerted, so a breach that happens while
+            # alerting is off surfaces once it's enabled (same rule the watchdog uses).
+            if await self._emit_alert(
+                'warning', f"High {label}",
+                f"{label} at {value:.0f}% (threshold {threshold:.0f}%).",
+                source='monitor', target=label, critical=True,
+            ):
+                self._alert_state[key] = True
         elif was and value < (threshold - 5):
             self._alert_state[key] = False
-            if output:
-                try:
-                    await output.alert(
-                        'success', f"{label} recovered", f"{label} back to {value:.0f}%.",
-                        source='monitor', target=label, critical=False,
-                    )
-                except Exception:
-                    pass
+            await self._emit_alert(
+                'success', f"{label} recovered", f"{label} back to {value:.0f}%.",
+                source='monitor', target=label, critical=False,
+            )
 
     def cog_unload(self):
         self.monitor_system.cancel()
@@ -207,12 +216,8 @@ class MonitoringCog(commands.Cog):
 
     async def _run_watchdog(self):
         dep = self.bot.get_cog('DeploymentCog')
-        output = self.bot.get_cog('OutputCog')
         if not dep:
             return
-        # Stamp the start of the watchdog's life so the startup grace can be measured.
-        if self._watch_started_at is None:
-            self._watch_started_at = datetime.now(timezone.utc)
 
         targets = await self._collect_targets()
         if not targets:
@@ -222,11 +227,9 @@ class MonitoringCog(commands.Cog):
         pm2_map = await dep._pm2_jlist_map()
         cert_map = await dep._all_certs_map()
 
-        # Detection/debounce always runs; only EMITTING alerts is gated. So when alerting is
-        # turned on later, anything genuinely still down alerts on the next tick (it was never
-        # marked "alerted" while suppressed).
-        alerts_on = self._alerts_active()
-
+        # Detection/debounce always runs; only EMITTING is gated (via _emit_alert). When
+        # alerting is turned on later, anything genuinely still down alerts on the next tick
+        # (it was never marked "alerted" while suppressed).
         for t in targets:
             problems = []
             if t['pm2_name']:
@@ -252,42 +255,29 @@ class MonitoringCog(commands.Cog):
             was_alerted = self._watch_state.get(key, False)
 
             if confirmed_down and not was_alerted:
-                # Suppress while alerting is off or in startup grace: don't alert, don't heal,
-                # and DON'T mark as alerted — so it surfaces once alerting is enabled.
-                if alerts_on:
+                # _emit_alert returns False while alerting is off or in startup grace — then we
+                # neither announce, heal, nor mark as alerted, so it surfaces once enabled.
+                if await self._emit_alert('error', f"Service down: {t['label']}", "; ".join(problems),
+                                          source='watchdog', target=t['label'], critical=True):
                     self._watch_state[key] = True
-                    if output:
-                        try:
-                            await output.alert('error', f"Service down: {t['label']}", "; ".join(problems),
-                                               source='watchdog', target=t['label'], critical=True)
-                        except Exception:
-                            pass
                     if self._heal_enabled:
-                        await self._attempt_heal(t, problems, dep, output)
+                        await self._attempt_heal(t, problems, dep)
             elif not now_down and was_alerted:
                 self._watch_state[key] = False
                 self._heal_attempts.pop(key, None)
-                if output and alerts_on:
-                    try:
-                        await output.alert('success', f"Service recovered: {t['label']}", "Back to healthy.",
-                                           source='watchdog', target=t['label'], critical=False)
-                    except Exception:
-                        pass
+                await self._emit_alert('success', f"Service recovered: {t['label']}", "Back to healthy.",
+                                       source='watchdog', target=t['label'], critical=False)
 
-    async def _attempt_heal(self, t, problems, dep, output):
+    async def _attempt_heal(self, t, problems, dep):
         """Safe auto-remediation (off by default): restart a down process, renew an expiring cert."""
         key = t['key']
         attempts = self._heal_attempts.get(key, 0)
         if attempts >= 3:
-            if output:
-                try:
-                    await output.alert(
-                        'warning', f"Auto-heal gave up: {t['label']}",
-                        f"Still unhealthy after {attempts} attempts; manual intervention needed.",
-                        source='watchdog', target=t['label'], critical=True,
-                    )
-                except Exception:
-                    pass
+            await self._emit_alert(
+                'warning', f"Auto-heal gave up: {t['label']}",
+                f"Still unhealthy after {attempts} attempts; manual intervention needed.",
+                source='watchdog', target=t['label'], critical=True,
+            )
             return
         self._heal_attempts[key] = attempts + 1
         if t['pm2_name'] and any('process' in p for p in problems):
@@ -304,8 +294,12 @@ class MonitoringCog(commands.Cog):
     @watchdog.before_loop
     async def before_tasks(self):
         await self.bot.wait_until_ready()
+        # Stamp monitoring's start once (after ready) so the startup grace applies uniformly to
+        # BOTH resource-threshold and watchdog alerts from the moment monitoring comes up.
+        if self._watch_started_at is None:
+            self._watch_started_at = datetime.now(timezone.utc)
 
-    @commands.slash_command(name="watchdog", description="Toggle watchdog down-alerts on/off")
+    @commands.slash_command(name="watchdog", description="Toggle ALL monitoring alerts (service + resource) on/off")
     async def slash_watchdog(self, ctx: discord.ApplicationContext, enabled: bool):
         if ctx.author.id != _DEV_ID:
             await ctx.respond("You are not authorized to use this command.", ephemeral=True)

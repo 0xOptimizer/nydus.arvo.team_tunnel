@@ -30,6 +30,7 @@ import json
 import logging
 import os
 import shutil
+import tempfile
 import uuid as uuid_lib
 from datetime import datetime, timezone
 
@@ -47,7 +48,11 @@ from database.db import (
     remove_github_project,
 )
 
-_SELFTEST_DIR = os.getenv('SELFTEST_REPO_DIR', '/var/lib/nydus/selftest')
+# Where the throwaway git fixtures live. Default to the system temp dir — the bot runs
+# as a non-root service user that can't create paths like /var/lib/nydus, and these
+# fixtures are ephemeral (git read/write only; the actual npm build runs under /var/www).
+# Override with SELFTEST_REPO_DIR if you want a stable location the bot user owns.
+_SELFTEST_DIR = os.getenv('SELFTEST_REPO_DIR') or os.path.join(tempfile.gettempdir(), 'nydus-selftest')
 _DEV_ID = int(os.getenv('DEV_ID', '0'))
 
 # Per-line timeout while relaying a sub-run's stream. A healthy deploy emits
@@ -230,6 +235,16 @@ class SelfTestCog(commands.Cog):
                 f"[SELFTEST] Starting (token={token}, staging={cert_staging}, "
                 f"steps={','.join(variants)}). Fixtures under {root}."
             )
+
+            # Create the fixture root up front so a bad SELFTEST_REPO_DIR fails once, clearly,
+            # instead of every step erroring identically with the same PermissionError.
+            try:
+                loop = asyncio.get_running_loop()
+                await loop.run_in_executor(None, lambda: os.makedirs(root, exist_ok=True))
+            except OSError as e:
+                await emit(f"[FATAL] Cannot create fixture directory {root}: {e}")
+                await emit("[FATAL] Set SELFTEST_REPO_DIR to a path the bot user can write, then retry.")
+                return  # finally still runs teardown + summary + clean stream close
 
             # ---- STATIC deploy ----
             if 'static' in variants:
