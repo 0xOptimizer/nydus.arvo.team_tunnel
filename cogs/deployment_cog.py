@@ -2663,6 +2663,10 @@ class DeploymentCog(commands.Cog):
 
                     await emit("[REBUILD] Performing health check...")
                     fqdn = fqdn_of(deployment)
+                    # Wait for the reloaded process to rebind before probing, so the health check
+                    # isn't racing pm2's restart window (which otherwise reads as a transient 502).
+                    if stack == 'node' and assigned_port:
+                        await self._http_port_ok(assigned_port)
                     health_ok = await self._http_health_check(fqdn, emit)
 
                     if health_ok:
@@ -2676,6 +2680,8 @@ class DeploymentCog(commands.Cog):
                         reverted = await self._revert_to_commit(
                             deploy_path, stack, pm2_name, assigned_port, prev_sha, emit
                         )
+                        if reverted and stack == 'node' and assigned_port:
+                            await self._http_port_ok(assigned_port)
                         if reverted and await self._http_health_check(fqdn, emit):
                             success = True
                             await emit("[ROLLBACK] Previous build restored; site healthy again.")

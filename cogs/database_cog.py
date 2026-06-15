@@ -127,57 +127,64 @@ class MySQLBackend(DatabaseBackend):
         raw_hosts = allowed_hosts if allowed_hosts else ['localhost']
         self._resolved_hosts = ['%'] if '*' in raw_hosts else raw_hosts
 
+    async def _exec(self, query: str, params=()) -> Tuple[bool, str]:
+        """Run one statement, returning (ok, real_error). Surfaces the actual DB error
+        (e.g. an Access-denied / missing-privilege message) instead of a bare 'query failed'."""
+        try:
+            await execute_query(query, params, raise_on_error=True)
+            return True, ""
+        except Exception as e:
+            return False, str(e)
+
     async def create_database(self, db_name: str) -> Tuple[bool, str]:
-        result = await execute_query(
+        ok, err = await self._exec(
             f"CREATE DATABASE `{db_name}` DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci"
         )
-        if result is None:
-            return False, f"Failed to create database `{db_name}`"
-        return True, ""
+        return (True, "") if ok else (False, f"Failed to create database `{db_name}`: {err}")
 
     async def drop_database(self, db_name: str) -> Tuple[bool, str]:
-        result = await execute_query(f"DROP DATABASE IF EXISTS `{db_name}`")
-        if result is None:
-            return False, f"Failed to drop database `{db_name}`"
-        return True, ""
+        ok, err = await self._exec(f"DROP DATABASE IF EXISTS `{db_name}`")
+        return (True, "") if ok else (False, f"Failed to drop database `{db_name}`: {err}")
 
+    # The account name is BOUND as parameters (%s@%s), not interpolated into the SQL: a literal
+    # '%' host in the query string breaks aiomysql's `query % args` formatting, and binding also
+    # guards against injection in the username/host.
     async def create_user(self, username: str, password: str, hosts: List[str]) -> Tuple[bool, str]:
         errors = []
         for host in (hosts or self._resolved_hosts):
-            result = await execute_query(
-                f"CREATE USER '{username}'@'{host}' IDENTIFIED BY %s",
-                (password,)
+            ok, err = await self._exec(
+                "CREATE USER %s@%s IDENTIFIED BY %s", (username, host, password)
             )
-            if result is None:
-                errors.append(f"{host}: query failed")
+            if not ok:
+                errors.append(f"{host}: {err}")
         return (False, "; ".join(errors)) if errors else (True, "")
 
     async def drop_user(self, username: str, hosts: List[str]) -> Tuple[bool, str]:
         errors = []
         for host in (hosts or self._resolved_hosts):
-            result = await execute_query(f"DROP USER IF EXISTS '{username}'@'{host}'")
-            if result is None:
-                errors.append(f"{host}: query failed")
+            ok, err = await self._exec("DROP USER IF EXISTS %s@%s", (username, host))
+            if not ok:
+                errors.append(f"{host}: {err}")
         return (False, "; ".join(errors)) if errors else (True, "")
 
     async def grant_privileges(self, db_name: str, username: str, privileges: str, hosts: List[str]) -> Tuple[bool, str]:
         errors = []
         for host in (hosts or self._resolved_hosts):
-            result = await execute_query(
-                f"GRANT {privileges} ON `{db_name}`.* TO '{username}'@'{host}'"
+            ok, err = await self._exec(
+                f"GRANT {privileges} ON `{db_name}`.* TO %s@%s", (username, host)
             )
-            if result is None:
-                errors.append(f"{host}: query failed")
+            if not ok:
+                errors.append(f"{host}: {err}")
         return (False, "; ".join(errors)) if errors else (True, "")
 
     async def revoke_privileges(self, db_name: str, username: str, privileges: str, hosts: List[str]) -> Tuple[bool, str]:
         errors = []
         for host in (hosts or self._resolved_hosts):
-            result = await execute_query(
-                f"REVOKE {privileges} ON `{db_name}`.* FROM '{username}'@'{host}'"
+            ok, err = await self._exec(
+                f"REVOKE {privileges} ON `{db_name}`.* FROM %s@%s", (username, host)
             )
-            if result is None:
-                errors.append(f"{host}: query failed")
+            if not ok:
+                errors.append(f"{host}: {err}")
         return (False, "; ".join(errors)) if errors else (True, "")
 
     async def backup(self, db_name: str, backup_path: str) -> Tuple[bool, str]:

@@ -65,7 +65,11 @@ async def execute_query(query, params=(), fetch_one=False, fetch_all=False, rais
     try:
         async with DB_POOL.acquire() as conn:
             async with conn.cursor(aiomysql.DictCursor) as cursor:
-                await cursor.execute(query, params)
+                # Pass None (not the default empty tuple) when there are no params: aiomysql
+                # only runs `query % args` when args is not None, and that formatting step
+                # blows up on any literal '%' in the SQL (e.g. a `'user'@'%'` grant) — which
+                # is exactly how a remote-host GRANT/CREATE USER turned into "query failed".
+                await cursor.execute(query, params if params else None)
 
                 if fetch_one:
                     return await cursor.fetchone()
