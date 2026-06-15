@@ -483,20 +483,25 @@ class DeploymentCog(commands.Cog):
         return self._active_streams.get(run_id)
 
     async def _http_health_check(self, fqdn: str, emit, attempts: int = 5) -> bool:
-        """Poll https://fqdn up to `attempts` times; True once it returns HTTP 200.
+        """Poll the ORIGIN directly until it returns HTTP 200; True once it does.
 
-        TLS verification is disabled (`ssl=False`): this check only answers "is the
-        site serving a 200", not "is the cert trusted" (cert validity is reported
-        separately via `_ssl_days_left`). Disabling it keeps the check correct when
-        the origin presents a Let's Encrypt *staging* cert (self-test) or a freshly
-        renewed chain a client hasn't picked up yet, instead of failing falsely.
+        We hit `https://127.0.0.1/` with a `Host: <fqdn>` header (TLS verification off)
+        rather than `https://<fqdn>`, because a rebuild only changes THIS host's app —
+        so the health signal should be this box's nginx→app, not the public edge. Going
+        through the public hostname instead couples the check to Cloudflare proxying,
+        fresh-subdomain DNS propagation, and cert trust — e.g. a Let's Encrypt *staging*
+        cert (self-test) makes Cloudflare return 526, failing a perfectly healthy site.
+        `ssl=False` because we don't care whether the origin cert is trusted here; cert
+        validity is reported separately via `_ssl_days_left`.
         """
+        timeout = aiohttp.ClientTimeout(total=10)
         for attempt in range(attempts):
             try:
-                async with aiohttp.ClientSession() as session:
+                async with aiohttp.ClientSession(
+                    connector=aiohttp.TCPConnector(ssl=False)
+                ) as session:
                     async with session.get(
-                        f"https://{fqdn}", timeout=aiohttp.ClientTimeout(total=10),
-                        ssl=False,
+                        "https://127.0.0.1/", headers={'Host': fqdn}, timeout=timeout,
                     ) as resp:
                         await emit(f"[HEALTH] HTTP {resp.status} (attempt {attempt+1}/{attempts}).")
                         if resp.status == 200:
@@ -1838,35 +1843,12 @@ class DeploymentCog(commands.Cog):
                             await emit(f"[WARN] pm2 process '{pm2_name}' not online ({detail}).")
 
                     await emit("[HEALTH] Performing HTTP health check...")
-                    health_ok = False
-                    for attempt in range(5):
-                        try:
-                            if cert_staging:
-                                # Staging cert is untrusted and Cloudflare would reject/serve it
-                                # inconsistently — hit the origin directly (127.0.0.1 + Host header,
-                                # TLS verification off) so the check reflects the real stack.
-                                session_ctx = aiohttp.ClientSession(
-                                    connector=aiohttp.TCPConnector(ssl=False)
-                                )
-                                url, headers = "https://127.0.0.1/", {'Host': fqdn}
-                            else:
-                                session_ctx = aiohttp.ClientSession()
-                                url, headers = f"https://{fqdn}", {}
-                            async with session_ctx as session:
-                                async with session.get(
-                                    url, headers=headers,
-                                    timeout=aiohttp.ClientTimeout(total=10)
-                                ) as resp:
-                                    if resp.status == 200:
-                                        health_ok = True
-                                        await emit(f"[HEALTH] Site responded with HTTP {resp.status} (attempt {attempt+1}/5).")
-                                        break
-                                    else:
-                                        await emit(f"[HEALTH] HTTP {resp.status} (attempt {attempt+1}/5).")
-                        except Exception as e:
-                            await emit(f"[HEALTH] Error: {e} (attempt {attempt+1}/5).")
-                        if attempt < 4:
-                            await asyncio.sleep(3)
+                    # Probe the ORIGIN directly (see _http_health_check) rather than the public
+                    # hostname: a just-created subdomain often isn't resolvable from this box yet
+                    # ("Name or service not known"), and a staging cert would 526 through Cloudflare
+                    # — either would falsely mark a live site 'unhealthy'. The origin is up the
+                    # moment nginx reloaded, independent of public DNS / Cloudflare / cert trust.
+                    health_ok = await self._http_health_check(fqdn, emit)
                     # The deploy pipeline completed (nginx/SSL/DNS/process all succeeded), so the
                     # site is live and must NOT be rolled back — but the HTTP health result is
                     # recorded durably as the deployment status instead of being overwritten.
